@@ -72,7 +72,54 @@ async function confirmInstall(text, source) {
   } catch (e) { console.log('安装失败：' + (e && e.message ? e.message : e)); }
 }
 
-async function downloadFlow() {
+async function flowDownloadUrl() {
+  const { url } = await prompt({ type: 'input', name: 'url', message: 'bdl-pack.json 的 http(s)/file URL' });
+  if (!url) return;
+  const { sha } = await prompt({ type: 'input', name: 'sha', message: 'sha256（可选，回车跳过）' });
+  try {
+    const text = await fetchText(url.trim());
+    await confirmInstall(text, { type: 'url', url: url.trim(), ...(sha && sha.trim() ? { sha256: sha.trim() } : {}) });
+  } catch (e) { console.log('下载失败：' + (e && e.message ? e.message : e)); }
+}
+
+async function flowDownloadGit() {
+  const { repo } = await prompt({ type: 'input', name: 'repo', message: 'git 仓库 URL（https/git@）' });
+  if (!repo) return;
+  const { ref } = await prompt({ type: 'input', name: 'ref', message: '分支/tag（可选，回车默认）' });
+  try {
+    const got = await downloadFromGit(repo.trim(), (ref && ref.trim()) || undefined);
+    await confirmInstall(got.text, { type: 'git', url: repo.trim(), ...(ref && ref.trim() ? { ref: ref.trim() } : {}) });
+  } catch (e) { console.log('下载失败：' + (e && e.message ? e.message : e)); }
+}
+
+/** 输 index URL 后返回「选包」下钻面板（由仪表盘在全屏内展示） */
+async function flowDownloadIndex() {
+  const { url } = await prompt({ type: 'input', name: 'url', message: 'index JSON 的 http(s)/file URL' });
+  if (!url) return;
+  let packs;
+  try {
+    const idx = await loadIndex(url.trim());
+    packs = searchPacks(idx.packs, '');
+  } catch (e) { console.log('下载失败：' + (e && e.message ? e.message : e)); return; }
+  if (!packs.length) { console.log('index 为空。'); return; }
+  return {
+    title: '选择整合包（' + packs.length + ' 个）',
+    info: [],
+    items: packs.filter((p) => p.url).map((p) => ({
+      label: p.name + ' v' + p.version,
+      hint: p.description || '',
+      run: async () => {
+        try {
+          const text = await fetchText(p.url);
+          await confirmInstall(text, { type: 'url', url: p.url, ...(p.sha256 ? { sha256: p.sha256 } : {}) });
+        } catch (e) { console.log('下载失败：' + (e && e.message ? e.message : e)); }
+      },
+    })),
+  };
+}
+
+/** 首次引导里的下载（普通模式，非全屏）：选源 → 对应流程 */
+async function bootstrapDownload() {
   const { src } = await prompt({
     type: 'select',
     name: 'src',
@@ -80,39 +127,21 @@ async function downloadFlow() {
     choices: ['直链 URL', 'git 仓库', 'bdl-pack index', '返回'],
   });
   if (src === '直链 URL') {
-    const { url } = await prompt({ type: 'input', name: 'url', message: 'bdl-pack.json 的 http(s)/file URL' });
-    if (!url) return;
-    const { sha } = await prompt({ type: 'input', name: 'sha', message: 'sha256（可选，回车跳过）' });
-    try {
-      const text = await fetchText(url.trim());
-      await confirmInstall(text, { type: 'url', url: url.trim(), ...(sha && sha.trim() ? { sha256: sha.trim() } : {}) });
-    } catch (e) { console.log('下载失败：' + (e && e.message ? e.message : e)); }
+    await flowDownloadUrl();
   } else if (src === 'git 仓库') {
-    const { repo } = await prompt({ type: 'input', name: 'repo', message: 'git 仓库 URL（https/git@）' });
-    if (!repo) return;
-    const { ref } = await prompt({ type: 'input', name: 'ref', message: '分支/tag（可选，回车默认）' });
-    try {
-      const got = await downloadFromGit(repo.trim(), (ref && ref.trim()) || undefined);
-      await confirmInstall(got.text, { type: 'git', url: repo.trim(), ...(ref && ref.trim() ? { ref: ref.trim() } : {}) });
-    } catch (e) { console.log('下载失败：' + (e && e.message ? e.message : e)); }
+    await flowDownloadGit();
   } else if (src === 'bdl-pack index') {
-    const { url } = await prompt({ type: 'input', name: 'url', message: 'index JSON 的 http(s)/file URL' });
-    if (!url) return;
-    try {
-      const idx = await loadIndex(url.trim());
-      const packs = searchPacks(idx.packs, '');
-      if (!packs.length) { console.log('index 为空。'); return; }
+    const panel = await flowDownloadIndex();
+    if (panel && panel.items.length) {
       const { pick } = await prompt({
         type: 'autocomplete',
         name: 'pick',
-        message: '搜索/选择整合包（' + packs.length + ' 个）',
-        choices: packs.map((p) => ({ name: p.id, message: p.name + ' v' + p.version + (p.description ? ' — ' + p.description : '') })),
+        message: panel.title,
+        choices: panel.items.map((it, i) => ({ name: String(i), message: it.label + (it.hint ? ' — ' + it.hint : '') })),
       });
-      const pack = packs.find((p) => p.id === pick);
-      if (!pack || !pack.url) { console.log('该条目无 url。'); return; }
-      const text = await fetchText(pack.url);
-      await confirmInstall(text, { type: 'url', url: pack.url, ...(pack.sha256 ? { sha256: pack.sha256 } : {}) });
-    } catch (e) { console.log('下载失败：' + (e && e.message ? e.message : e)); }
+      const it = panel.items[Number(pick)];
+      if (it && it.run) await it.run();
+    }
   }
 }
 
@@ -217,65 +246,98 @@ async function flowBatchUpdate(profile) {
   console.log('批量更新完成。');
 }
 
-async function flowInstallVersion() {
+async function flowInstallOne(v) {
+  const { ok } = await prompt({ type: 'confirm', name: 'ok', message: '将下载约 529 包 / 334MB，确认安装 ' + v + '？', initial: true });
+  if (!ok) return;
+  console.log('安装 ' + v + '（可能需要数分钟，进度实时显示）…');
+  try { const bin = await installVersion(v); console.log('安装完成：' + bin); }
+  catch (e) { console.log('安装失败：' + (e && e.message ? e.message : e)); }
+}
+
+function flowShowManualInstall(v) {
+  console.log('请在终端自己执行（装完回来自动识别）：');
+  console.log('');
+  console.log('  npm install --prefix ' + join(versionsDir(), v) + ' --no-save @deepseek-ai/dsh@' + v);
+  console.log('');
+  console.log('约 529 包 / 334MB / 2 分钟；中途反悔直接 Ctrl-C，不影响任何现有版本。');
+}
+
+/** 安装版本：远程版本列表面板 → 每个版本下钻安装方式 */
+async function installVersionPanel() {
   const { versions, distTags } = await remoteVersions();
-  if (!versions || !versions.length) { console.log('无法获取远程版本（离线？）。'); return; }
-  const latest = (distTags && distTags.latest) || versions[versions.length - 1];
-  const choices = versions.map((v) => ({ name: v, message: v + (v === latest ? '（latest）' : '') }));
-  const { v } = await prompt({ type: 'autocomplete', name: 'v', message: '选择要安装的版本', choices });
-  if (!v) return;
-  const { way } = await prompt({
-    type: 'select',
-    name: 'way',
-    message: '安装方式',
-    choices: ['一键安装（bdl 代跑 npm，推荐）', '显示手动安装命令', '返回'],
-  });
-  if (way === '一键安装（bdl 代跑 npm，推荐）') {
-    const { ok } = await prompt({ type: 'confirm', name: 'ok', message: '将下载约 529 包 / 334MB，确认安装 ' + v + '？', initial: true });
-    if (!ok) return;
-    console.log('安装 ' + v + '（可能需要数分钟，进度实时显示）…');
-    try { const bin = await installVersion(v); console.log('安装完成：' + bin); }
-    catch (e) { console.log('安装失败：' + (e && e.message ? e.message : e)); }
-  } else if (way === '显示手动安装命令') {
-    console.log('请在终端自己执行（装完回本菜单即自动识别）：');
-    console.log('');
-    console.log('  npm install --prefix ' + join(versionsDir(), v) + ' --no-save @deepseek-ai/dsh@' + v);
-    console.log('');
-    console.log('约 529 包 / 334MB / 2 分钟；中途反悔直接 Ctrl-C，不影响任何现有版本。');
+  if (!versions || !versions.length) {
+    return { title: '安装版本', info: [c.gray('无法获取远程版本（离线？）')], items: [] };
   }
+  const latest = (distTags && distTags.latest) || versions[versions.length - 1];
+  return {
+    title: '安装版本 — 选择版本',
+    info: [],
+    items: versions.map((v) => ({
+      label: v + (v === latest ? '（latest）' : ''),
+      children: () => ({
+        title: '安装 ' + v,
+        info: [c.gray('约 529 包 / 334MB / 2 分钟')],
+        items: [
+          { label: '一键安装（推荐）', hint: 'bdl 代跑 npm', run: () => flowInstallOne(v) },
+          { label: '显示手动安装命令', run: () => flowShowManualInstall(v) },
+        ],
+      }),
+    })),
+  };
 }
 
-async function flowSwitchDefault() {
+/** 切换默认版本：内联生效，状态行反馈 */
+async function switchDefaultPanel() {
   const installed = await installedVersions();
-  const choices = [{ name: 'system', message: 'system（系统版）' }, ...installed.map((iv) => ({ name: iv.version, message: iv.version }))];
-  const { v } = await prompt({ type: 'select', name: 'v', message: '选择默认版本', choices });
-  if (!v) return;
-  await setDefault(v);
-  console.log('默认版本已设为 ' + v);
+  const panel = {
+    title: '选择默认版本',
+    info: [],
+    items: [
+      { label: 'system', hint: '系统版', inline: true, run: async () => { await setDefault('system'); return '默认版本已设为 system'; } },
+      ...installed.map((iv) => ({
+        label: iv.version, inline: true,
+        run: async () => { await setDefault(iv.version); return '默认版本已设为 ' + iv.version; },
+      })),
+    ],
+  };
+  panel.rebuild = switchDefaultPanel;
+  return panel;
 }
 
-async function flowRemoveVersion() {
+/** 删除版本：内联执行，面板原地刷新 */
+async function removeVersionPanel() {
   const installed = await installedVersions();
-  if (!installed.length) { console.log('无已装版本。'); return; }
-  const { v } = await prompt({ type: 'select', name: 'v', message: '选择要删除的版本', choices: installed.map((iv) => iv.version) });
-  if (!v) return;
-  try { await removeVersion(v); console.log('已删除 ' + v); }
-  catch (e) { console.log('删除失败：' + (e && e.message ? e.message : e)); }
+  const panel = {
+    title: '选择要删除的版本',
+    info: installed.length ? [] : [c.gray('（无已装版本）')],
+    items: installed.map((iv) => ({
+      label: iv.version,
+      inline: true,
+      run: async () => { await removeVersion(iv.version); return '已删除 ' + iv.version; },
+    })),
+  };
+  panel.rebuild = removeVersionPanel;
+  return panel;
 }
 
-async function flowLockProfile(profile) {
+/** 锁定整合包版本：版本列表面板，内联生效 */
+async function lockVersionPanel(profile) {
   const installed = await installedVersions();
-  const choices = [
-    { name: 'follow', message: '跟随默认（解除锁定）' },
-    { name: 'system', message: 'system（系统版）' },
-    ...installed.map((iv) => ({ name: iv.version, message: iv.version })),
-  ];
-  const { v } = await prompt({ type: 'select', name: 'v', message: '选择 ' + profile + ' 锁定的版本', choices });
-  if (!v) return;
-  await setProfileLock(profile, v === 'follow' ? null : v);
-  console.log('已设置 ' + profile + ' 的锁定版本：' + (v === 'follow' ? '跟随默认' : v));
+  const build = async () => lockVersionPanel(profile);
+  return {
+    title: '选择 ' + profile + ' 锁定的版本',
+    info: [c.gray('当前：' + profileDshVersion(profile))],
+    rebuild: build,
+    items: [
+      { label: '跟随默认（解除锁定）', inline: true, run: async () => { await setProfileLock(profile, null); return profile + ' 已解除锁定，跟随默认'; } },
+      { label: 'system', hint: '系统版', inline: true, run: async () => { await setProfileLock(profile, 'system'); return profile + ' 锁定为 system'; } },
+      ...installed.map((iv) => ({
+        label: iv.version, inline: true,
+        run: async () => { await setProfileLock(profile, iv.version); return profile + ' 锁定为 ' + iv.version; },
+      })),
+    ],
+  };
 }
-
 async function flowUpgrade(profile) {
   console.log('将快照 package.json / pnpm-lock.yaml / cordis.patch.yml 后执行 pnpm update…');
   try {
@@ -476,7 +538,18 @@ const CATS = [
           })),
         },
         { label: '新建整合包', hint: '手动选插件', run: flowCreatePack },
-        { label: '下载整合包', hint: 'URL / git / index', run: downloadFlow },
+        {
+          label: '下载整合包', hint: 'URL / git / index',
+          children: () => ({
+            title: '下载整合包 — 选择来源',
+            info: [],
+            items: [
+              { label: '直链 URL', hint: 'bdl-pack.json 的 http(s)/file 地址', run: flowDownloadUrl },
+              { label: 'git 仓库', hint: 'https/git@ 仓库', run: flowDownloadGit },
+              { label: 'bdl-pack index', hint: '从索引里挑选', run: flowDownloadIndex },
+            ],
+          }),
+        },
         { label: '导入整合包', hint: '本地 bdl-pack.json', run: flowImportPack },
         { label: '导出整合包', children: async () => profilesPanel(await gatherContext(), '选择要导出的整合包', (p) => ({ run: () => flowExportPack(p.name) })) },
         { label: '复制整合包', children: async () => profilesPanel(await gatherContext(), '选择要复制的整合包', (p) => ({ run: () => flowCopyPack(p.name) })) },
@@ -505,10 +578,10 @@ const CATS = [
           : c.gray('已装      （BDL 尚未安装任何版本）'),
       ],
       items: [
-        { label: '安装版本', hint: '从 npm 拉取', run: flowInstallVersion },
-        { label: '切换默认版本', run: flowSwitchDefault },
-        { label: '删除版本', run: flowRemoveVersion },
-        { label: '锁定整合包版本', children: async () => profilesPanel(await gatherContext(), '选择要锁定版本的整合包', (p) => ({ run: () => flowLockProfile(p.name) })) },
+        { label: '安装版本', hint: '从 npm 拉取', children: installVersionPanel },
+        { label: '切换默认版本', hint: '内联生效', children: switchDefaultPanel },
+        { label: '删除版本', children: removeVersionPanel },
+        { label: '锁定整合包版本', children: async () => profilesPanel(await gatherContext(), '选择要锁定版本的整合包', (p) => ({ children: () => lockVersionPanel(p.name) })) },
       ],
     }),
   },
@@ -686,6 +759,14 @@ async function dashboard() {
     try { r = await item.run(); }
     catch (e) { if (!isCancel(e)) console.log('出错了：' + (e && e.message ? e.message : e)); }
     if (r === 'exit') return 'exit';
+    // 流程可以返回一个下钻面板（如先输 index URL，再回面板里选包）
+    if (r && typeof r === 'object' && Array.isArray(r.items)) {
+      screen.enter();
+      r.sel = 0;
+      stack.push(r);
+      paint();
+      return;
+    }
     await waitKey();
     screen.enter();
     await refreshRoot();
@@ -801,7 +882,7 @@ export async function runTui() {
         choices: ['下载整合包（URL / git / index）', '导入本地 bdl-pack.json', '新建整合包（手动选插件）', '退出'],
       });
       if (first === '下载整合包（URL / git / index）') {
-        await downloadFlow();
+        await bootstrapDownload();
       } else if (first === '导入本地 bdl-pack.json') {
         await flowImportPack();
       } else if (first === '新建整合包（手动选插件）') {
