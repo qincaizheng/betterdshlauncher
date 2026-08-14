@@ -1,0 +1,101 @@
+{
+  "format": "bdl-pack",
+  "manifestVersion": 1,
+  "id": "oh-my-dsh",
+  "name": "oh-my-dsh 整合包",
+  "version": "1.0.0",
+  "description": "DeepSeek Harness（DSH）一键整合包：16 组精选插件 + 开箱配置，覆盖 Web UI 全家桶、编码工具链、权限 auto 档、/btw 侧问与第三方插件兼容修复层。（按 DSH 0.1.0-rc.6 实测整理）",
+  "author": "qincaizheng",
+  "dsh": {
+    "minVersion": "0.1.0-rc.6",
+    "profileTemplate": "web"
+  },
+  "bundles": [
+    {
+      "name": "@deepseek-ai/dsh-base",
+      "version": "^0.1.0-rc.6"
+    },
+    {
+      "name": "@deepseek-ai/dsh-web-app",
+      "version": "^0.1.0-rc.6"
+    },
+    {
+      "name": "@linxin666/dsh-web-ui-all",
+      "version": "^0.1.12"
+    },
+    {
+      "name": "@canglongcl/dsh-web-review",
+      "version": "^0.1.0"
+    },
+    {
+      "name": "@zseven-w/dsh-openpencil",
+      "version": "0.1.0-rc.1"
+    },
+    {
+      "name": "dsh-auto-approval",
+      "version": "^0.1.0"
+    },
+    {
+      "name": "dsh-at-file",
+      "source": "link",
+      "path": "~/.dsh/plugins/dsh-at-file"
+    },
+    {
+      "name": "dsh-agent-teams",
+      "source": "link",
+      "path": "~/.dsh/plugins/dsh-agent-teams"
+    },
+    {
+      "name": "@loserfox/git-identity",
+      "source": "link",
+      "path": "~/.dsh/plugins/dsh-git-identity"
+    },
+    {
+      "name": "@dsh-external/plugin-console",
+      "source": "link",
+      "path": "~/.dsh/plugins/plugin-registry/packages/plugin/console"
+    },
+    {
+      "name": "@deepseek-ai/dsh-toolkit",
+      "source": "link",
+      "path": "~/.dsh/plugins/dsh-toolkit"
+    },
+    {
+      "name": "@dsh-external/dsh-sidechain",
+      "source": "link",
+      "path": "~/.dsh/plugins/dsh-sidechain"
+    },
+    {
+      "name": "@dsh-external/dsh-upstream-fixes",
+      "source": "link",
+      "path": "~/.dsh/plugins/dsh-upstream-fixes"
+    },
+    {
+      "name": "dsh-mcp-manager",
+      "source": "link",
+      "path": "~/.dsh/plugins/dsh-mcp-manager"
+    },
+    {
+      "name": "@omdsh-dev/dsh-annotation",
+      "source": "link",
+      "path": "~/.dsh/plugins/dsh-annotation"
+    }
+  ],
+  "deps": [
+    {
+      "name": "dsh-better-sidebar",
+      "source": "link",
+      "path": "~/.dsh/plugins/DSH-better-sidebar"
+    },
+    {
+      "name": "@dsh-community/dsh-paste-input",
+      "source": "link",
+      "path": "~/.dsh/plugins/dsh-paste-input"
+    },
+    {
+      "name": "dsh-client-ui-auto-approval",
+      "version": "^0.1.0"
+    }
+  ],
+  "patch": "- insert:\n    - id: better-sidebar\n      name: 'dsh-better-sidebar'\n- insert:\n    - id: dsh-paste-input\n      name: '@dsh-community/dsh-paste-input'\n# 默认禁用清单（DISABLED.md）\n- id: ui-dsh-aionui-panel\n  disabled: true\n- id: live-stats\n  disabled: true\n- id: dsh-sidechain\n  disabled: true\n"
+}

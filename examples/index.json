@@ -1,0 +1,18 @@
+{
+  "format": "bdl-pack-index",
+  "version": 1,
+  "updatedAt": "2026-08-14T10:12:41.895Z",
+  "packs": [
+    {
+      "id": "oh-my-dsh",
+      "name": "oh-my-dsh 整合包",
+      "description": "DSH 一键整合包：16 组精选插件（Web UI 全家桶 + 编码工具链 + 修复层），按 PLUGINS.md 权威清单导出",
+      "version": "1.0.0",
+      "url": "file:///Users/qdd/codex/workspace/betterdshlauncher/examples/oh-my-dsh.bdl-pack.json",
+      "sha256": "53b4eb2e6ccce78c2f2626f002b51dbfe3eb1614e52de6a39dbbf02d52fcbd2f",
+      "dsh": {
+        "minVersion": "0.1.0-rc.6"
+      }
+    }
+  ]
+}

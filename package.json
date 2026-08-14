@@ -1,0 +1,17 @@
+{
+  "name": "betterdshlauncher",
+  "version": "0.1.0",
+  "description": "bdl — a thin interactive launcher over the dsh CLI (profiles = bundle sets)",
+  "type": "module",
+  "bin": {
+    "bdl": "./bin/bdl.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "enquirer": "^2.4.1",
+    "js-yaml": "^4.1.0"
+  }
+}
