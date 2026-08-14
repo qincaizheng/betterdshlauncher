@@ -1,6 +1,6 @@
 // src/tui.mjs — enquirer 多级菜单（P0 子集：启动 / 整合包管理 / 插件管理 / 校验）
 import Enquirer from 'enquirer';
-import { discoverProfiles, listBundles, isValidProfileName, defaultDshVersion, profileDshVersion, defaultProfile, setDefaultProfile, writeNpmrc, readNpmrc, loadMeta, versionsDir } from './registry.mjs';
+import { discoverProfiles, listBundles, isValidProfileName, defaultDshVersion, profileDshVersion, defaultProfile, setDefaultProfile, writeNpmrc, readNpmrc, loadMeta, metaPath, versionsDir } from './registry.mjs';
 import { remoteVersions, installedVersions, systemVersion, installVersion, removeVersion, setDefault, setProfileLock } from './dsh-version.mjs';
 import { runPlugin } from './dsh.mjs';
 import { resolveForProfile } from './dsh-version.mjs';
@@ -14,6 +14,7 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { handoffToDsh } from './handoff.mjs';
 import { disableBundle, enableBundle, disabledIds } from './patch-edit.mjs';
+import { Screen, renderFrame, c } from './ui/frame.mjs';
 
 const enquirer = new Enquirer();
 
@@ -457,6 +458,269 @@ async function versionMenu() {
   else if (op === '显示系统版本') console.log('系统 dsh 版本：' + await systemVersion());
 }
 
+// ---- 仪表盘主界面（header / 左侧导航 / body / footer） ---------------------
+
+const MENU = [
+  { id: 'launch',   label: '启动整合包',   desc: '选择整合包并启动 dsh' },
+  { id: 'packs',    label: '整合包管理',   desc: '新建 / 导入 / 导出 / 下载 / 复制 / 重命名 / 删除' },
+  { id: 'plugins',  label: '插件管理',     desc: 'bundle 列表、启停、增删与更新' },
+  { id: 'version',  label: 'dsh 版本管理', desc: '安装 / 切换 / 锁定 dsh 版本' },
+  { id: 'upgrade',  label: '升级与回滚',   desc: '依赖升级（带快照）与一键回滚' },
+  { id: 'isolate',  label: '环境隔离',     desc: '独立 DSH_HOME 的隔离环境' },
+  { id: 'verify',   label: '校验整合包',   desc: '--dump-config 组合校验' },
+  { id: 'diagnose', label: '诊断',         desc: '查看运行日志' },
+  { id: 'settings', label: '设置',         desc: '默认整合包 / 启动参数 / 镜像源' },
+  { id: 'quit',     label: '退出',         desc: '退出 bdl' },
+];
+
+/** 汇总仪表盘右侧 body 需要的状态（均为本地读，开销小） */
+async function gatherContext() {
+  const [profiles, installed, sys, envs, meta, logs] = await Promise.all([
+    discoverProfiles(), installedVersions(), systemVersion(), listIsolatedEnvs(), loadMeta(), listLogs(),
+  ]);
+  return {
+    profiles, installed, sys, envs, meta, logs,
+    def: defaultProfile(),
+    dshDef: defaultDshVersion(),
+  };
+}
+
+function shortTime(iso) {
+  return String(iso || '').replace('T', ' ').slice(0, 16);
+}
+
+function recentProfiles(ctx, n) {
+  const names = new Set(ctx.profiles.map((p) => p.name));
+  return Object.entries((ctx.meta && ctx.meta.bundles) || {})
+    .filter(([name, v]) => names.has(name) && v && v.lastUsedAt)
+    .sort((a, b) => (a[1].lastUsedAt < b[1].lastUsedAt ? 1 : -1))
+    .slice(0, n)
+    .map(([name, v]) => ({ name, at: v.lastUsedAt }));
+}
+
+/** 各菜单项的 body 内容（进入仪表盘时一次性算好，按键移动不重算） */
+function buildBodies(ctx) {
+  const cap = (arr, n, more) => {
+    const head = arr.slice(0, n);
+    if (arr.length > n) head.push(c.gray('  … 还有 ' + (arr.length - n) + more));
+    return head;
+  };
+  const bodies = {};
+
+  {
+    const recent = recentProfiles(ctx, 4);
+    bodies.launch = {
+      title: '启动整合包',
+      lines: [
+        c.gray('默认整合包  ') + (ctx.def ? c.green(ctx.def) : '（未设置）'),
+        c.gray('dsh 版本    ') + ctx.dshDef,
+        '',
+        recent.length ? '最近使用：' : c.gray('（还没有启动记录）'),
+        ...recent.map((r2) => '  • ' + r2.name + '  ' + c.gray(shortTime(r2.at))),
+        '',
+        c.gray('Enter 选择整合包并启动 dsh（启动后本界面退出）。'),
+      ],
+    };
+  }
+
+  {
+    const lines = [
+      ctx.profiles.length ? '共 ' + ctx.profiles.length + ' 个整合包：' : c.gray('（还没有整合包）'),
+      ...cap(ctx.profiles.map((p) =>
+        '  • ' + p.name + (p.name === ctx.def ? c.green('（默认）') : '') + c.gray('  ' + p.bundles.length + ' 个 bundle')
+      ), 7, ' 个'),
+    ];
+    bodies.packs = { title: '整合包管理', lines: [...lines, '', c.gray(MENU[1].desc)] };
+  }
+
+  {
+    const p = ctx.profiles.find((x) => x.name === ctx.def) || ctx.profiles[0];
+    const lines = p
+      ? ['整合包 ' + c.cyan(p.name) + ' 的 bundle：',
+         ...cap(p.bundles.map((b) => '  • ' + c.dim(b)), 8, ' 个')]
+      : [c.gray('（先创建一个整合包）')];
+    bodies.plugins = { title: '插件管理', lines: [...lines, '', c.gray(MENU[2].desc)] };
+  }
+
+  {
+    const lines = [
+      c.gray('系统版本  ') + ctx.sys + (ctx.dshDef === 'system' ? c.green('（默认）') : ''),
+      c.gray('默认版本  ') + ctx.dshDef,
+      '',
+      ctx.installed.length ? 'BDL 管理的版本：' : c.gray('（BDL 尚未安装任何版本）'),
+      ...ctx.installed.map((iv) =>
+        '  • ' + iv.version + (ctx.dshDef === iv.version ? c.green('（默认）') : '')
+      ),
+    ];
+    bodies.version = { title: 'dsh 版本管理', lines: [...lines, '', c.gray(MENU[3].desc)] };
+  }
+
+  bodies.upgrade = {
+    title: '升级与回滚',
+    lines: [
+      '依赖升级：快照 package.json / pnpm-lock.yaml / cordis.patch.yml',
+      '          后执行 pnpm update。',
+      '回滚：    从快照目录一键恢复。',
+      '',
+      c.gray('升级后建议立即执行一次「校验整合包」。'),
+    ],
+  };
+
+  bodies.isolate = {
+    title: '环境隔离',
+    lines: [
+      ctx.envs.length ? '共 ' + ctx.envs.length + ' 个隔离环境：' : c.gray('（无隔离环境）'),
+      ...cap(ctx.envs.map((e) => '  • ' + e), 8, ' 个'),
+      '',
+      c.gray('整树隔离 = 独立 DSH_HOME，互不污染。'),
+    ],
+  };
+
+  bodies.verify = {
+    title: '校验整合包',
+    lines: [
+      '以 --dump-config 启动目标整合包，验证 bundle 组合可以正常加载。',
+      '',
+      c.gray('失败时会展示输出尾部与修复提示。'),
+    ],
+  };
+
+  bodies.diagnose = {
+    title: '诊断',
+    lines: [
+      ctx.logs.length ? '共 ' + ctx.logs.length + ' 个日志文件：' : c.gray('（无日志文件）'),
+      ...cap(ctx.logs.map((l) => '  • ' + c.dim(l)), 8, ' 个'),
+    ],
+  };
+
+  bodies.settings = {
+    title: '设置',
+    lines: [
+      c.gray('默认整合包  ') + (ctx.def || '（未设置）'),
+      c.gray('元数据      ') + c.dim(metaPath()),
+      '',
+      c.gray(MENU[8].desc),
+    ],
+  };
+
+  bodies.quit = { title: '退出', lines: [c.gray('感谢使用 bdl。')] };
+  return bodies;
+}
+
+/** 全屏仪表盘：返回选中菜单 id（'quit' 表示退出） */
+async function dashboard(ctx, bodies) {
+  const screen = new Screen();
+  let sel = 0;
+  const paint = () => {
+    const m = MENU[sel];
+    const body = bodies[m.id];
+    screen.render(renderFrame({
+      cols: screen.cols,
+      rows: screen.rows,
+      headerLeft: 'bdl · Better DSH Launcher',
+      headerRight: '整合包 ' + (ctx.def || '—') + ' · dsh ' + ctx.dshDef,
+      navCaption: '导航',
+      menu: MENU,
+      selected: sel,
+      bodyTitle: body.title,
+      bodyLines: body.lines,
+      footerLeft: '↑/↓ 或 j/k 移动 · Enter 进入 · 1-9 跳转 · q 退出',
+      footerRight: m.desc,
+    }));
+  };
+  screen.onResize = paint;
+  screen.enter();
+  try {
+    paint();
+    for (;;) {
+      const k = await screen.key();
+      if (k.name === 'up') { sel = (sel + MENU.length - 1) % MENU.length; paint(); }
+      else if (k.name === 'down') { sel = (sel + 1) % MENU.length; paint(); }
+      else if (k.name === 'num') { if (k.n >= 1 && k.n <= MENU.length) { sel = k.n - 1; paint(); } }
+      else if (k.name === 'enter' || k.name === 'right') return MENU[sel].id;
+      else if (k.name === 'quit' || k.name === 'ctrl-c' || k.name === 'esc') return 'quit';
+    }
+  } finally {
+    screen.exit();
+  }
+}
+
+/** 小终端回退：传统 enquirer 列表菜单 */
+async function classicMenu() {
+  const { action } = await prompt({
+    type: 'select',
+    name: 'action',
+    message: 'bdl 主菜单',
+    choices: MENU.map((m) => m.label),
+  });
+  const m = MENU.find((x) => x.label === action);
+  return m ? m.id : 'quit';
+}
+
+/** 流程输出后暂停，等待用户按键再回全屏 */
+function waitKey(message) {
+  return new Promise((resolve) => {
+    process.stdout.write('\n' + (message || '按任意键返回主菜单…'));
+    const stdin = process.stdin;
+    if (!stdin.isTTY) { process.stdout.write('\n'); resolve(); return; }
+    stdin.setRawMode(true);
+    stdin.resume();
+    const onData = () => {
+      stdin.off('data', onData);
+      stdin.setRawMode(false);
+      stdin.pause();
+      process.stdout.write('\n');
+      resolve();
+    };
+    stdin.on('data', onData);
+  });
+}
+
+function isCancel(e) {
+  const msg = typeof e === 'string' ? e : (e && e.message ? String(e.message) : '');
+  return msg === '' || msg.toLowerCase().includes('cancel');
+}
+
+/** 执行一个菜单动作；返回 'exit' 表示应结束整个 TUI（启动整合包） */
+async function runAction(id) {
+  if (id === 'launch') {
+    const profile = await pickProfile('选择要启动的整合包');
+    if (profile) { await handoffToDsh({ profile }); return 'exit'; }
+  } else if (id === 'packs') {
+    await managePacks();
+  } else if (id === 'plugins') {
+    await managePlugins();
+  } else if (id === 'upgrade') {
+    await upgradeMenu();
+  } else if (id === 'isolate') {
+    await isolateMenu();
+  } else if (id === 'diagnose') {
+    await diagnoseMenu();
+  } else if (id === 'settings') {
+    await settingsMenu();
+  } else if (id === 'version') {
+    await versionMenu();
+  } else if (id === 'verify') {
+    const profile = await pickProfile('选择要校验的整合包');
+    if (profile) {
+      console.log('校验 ' + profile + '（--dump-config）…');
+      let dsh;
+      try { dsh = resolveForProfile(profile); }
+      catch (e) { console.log('无法解析该整合包使用的 dsh：' + (e && e.message ? e.message : e)); return; }
+      const r = await captureDump(profile, dsh);
+      console.log('校验退出码：' + r.code);
+      if (r.code !== 0) {
+        console.log('--- 输出尾部 ---');
+        console.log((r.err || r.out).split('\n').slice(-10).join('\n') || '(无输出)');
+        console.log('--- 提示 ---');
+        for (const h of parseHints(r)) console.log('• ' + h);
+      } else {
+        console.log('组合校验通过。');
+      }
+    }
+  }
+}
+
 /** 进入 TUI 主循环；启动整合包会通过 handoffToDsh 结束进程 */
 export async function runTui() {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
@@ -505,54 +769,25 @@ export async function runTui() {
       const after = await discoverProfiles();
       if (after.length === 0) return;
     }
+
+    // 终端太小（或行数不足）时回退传统列表菜单
+    const useDashboard = (process.stdout.columns || 80) >= 64 && (process.stdout.rows || 24) >= 18;
     for (;;) {
-      const { action } = await prompt({
-        type: 'select',
-        name: 'action',
-        message: 'bdl 主菜单',
-        choices: ['启动整合包', '整合包管理', '插件管理', '升级与回滚', '环境隔离', '诊断', 'dsh 版本管理', '校验整合包', '设置', '退出'],
-      });
-      if (action === '退出') break;
-      if (action === '启动整合包') {
-        const profile = await pickProfile('选择要启动的整合包');
-        if (profile) { await handoffToDsh({ profile }); return; }
-      } else if (action === '整合包管理') {
-        await managePacks();
-      } else if (action === '插件管理') {
-        await managePlugins();
-      } else if (action === '升级与回滚') {
-        await upgradeMenu();
-      } else if (action === '环境隔离') {
-        await isolateMenu();
-      } else if (action === '诊断') {
-        await diagnoseMenu();
-      } else if (action === '设置') {
-        await settingsMenu();
-      } else if (action === 'dsh 版本管理') {
-        await versionMenu();
-      } else if (action === '校验整合包') {
-        const profile = await pickProfile('选择要校验的整合包');
-        if (profile) {
-          console.log('校验 ' + profile + '（--dump-config）…');
-          let dsh;
-          try { dsh = resolveForProfile(profile); }
-          catch (e) { console.log('无法解析该整合包使用的 dsh：' + (e && e.message ? e.message : e)); return; }
-          const r = await captureDump(profile, dsh);
-          console.log('校验退出码：' + r.code);
-          if (r.code !== 0) {
-            console.log('--- 输出尾部 ---');
-            console.log((r.err || r.out).split('\n').slice(-10).join('\n') || '(无输出)');
-            console.log('--- 提示 ---');
-            for (const h of parseHints(r)) console.log('• ' + h);
-          } else {
-            console.log('组合校验通过。');
-          }
-        }
+      const ctx = await gatherContext();
+      const id = useDashboard ? await dashboard(ctx, buildBodies(ctx)) : await classicMenu();
+      if (id === 'quit') break;
+      let result;
+      try {
+        result = await runAction(id);
+      } catch (e) {
+        if (isCancel(e)) continue; // 子流程里 Esc/Ctrl-C：回主菜单而不是退出
+        throw e;
       }
+      if (result === 'exit') return;
+      await waitKey();
     }
   } catch (e) {
-    const msg = typeof e === 'string' ? e : (e && e.message ? String(e.message) : '');
-    if (msg === '' || msg.toLowerCase().includes('cancel')) {
+    if (isCancel(e)) {
       console.log('\n已取消。');
       process.exit(0);
     }

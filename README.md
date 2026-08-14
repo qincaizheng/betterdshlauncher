@@ -3,7 +3,7 @@
 对 dsh CLI（DeepSeek Harness 启动器）的薄交互层：把「裸跑 dsh 无交互、整合包（bundle set）切换要手动改 profile」两个痛点，换成菜单式操作。
 
 - 独立指令 `bdl`，**不接管、不遮蔽真实 `dsh`**（原 `dsh` 行为完全不变）。
-- `bdl` 无参数 → TUI 菜单（选整合包启动 / 管理整合包 / 管理插件 / 校验）。
+- `bdl` 无参数 → 全屏 TUI 仪表盘（顶栏状态 / 左侧导航 / 右侧实时概览；↑↓/j/k 移动、Enter 进入、1-9 跳转、q 退出；终端 <64×18 或 NO_COLOR 时自动回退普通列表菜单）。
 - `bdl <args>` → 原样直通真实 dsh（`bdl web` ≡ `dsh web`，`bdl --version` ≡ `dsh --version`）。
 
 ## 功能
