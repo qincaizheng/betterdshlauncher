@@ -97,20 +97,22 @@ function centerWindow(sel, len, avail) {
  *   navCaption, menu: [{ label }], selected, navFocused,
  *   bodyTitle, bodyInfo: [string],
  *   bodyItems: [{ label, hint? }], bodySel, bodyFocused,
+ *   bodyBack,                           // 子面板：渲染可点击的「‹ 返回」行
  *   footerLeft, footerRight,
  * }
  * 返回 { text, layout }；layout 记录可点击区域的绝对终端坐标：
- *   { leftW, navY, navOffset, bodyItemY, bodyOffset }
+ *   { leftW, navY, navOffset, bodyItemY, bodyOffset, backY }
  */
 export function renderFrame(o) {
   const cols = o.cols;
   const rows = o.rows;
 
   const bar = (left, right) => {
-    const l = ' ' + (left || '');
-    const r = right ? right + ' ' : '';
-    const gap = Math.max(1, cols - stringWidth(l) - stringWidth(r));
-    return c.inverse(padEnd(truncate(l, cols), stringWidth(l)) + ' '.repeat(gap) + truncate(r, Math.max(0, cols - stringWidth(l) - gap)));
+    const l = truncate(' ' + (left || ''), cols);
+    const lw = stringWidth(l);
+    const r = right ? truncate(right + ' ', Math.max(0, cols - lw - 1)) : '';
+    const gap = Math.max(0, cols - lw - stringWidth(r));
+    return c.inverse(l + ' '.repeat(gap) + r);
   };
 
   // 左栏宽度：最宽菜单项 + 留白，夹在 [16, 28] 且不超过半屏
@@ -139,14 +141,16 @@ export function renderFrame(o) {
   while (left.length < contentRows) left.push('');
 
   // ---- 右栏（body 面板） ----
-  // 内容行布局：r0 空 / r1 标题 / r2 空 / 信息行… / 空 / 条目（窗口滚动）
+  // 内容行布局：r0 空 / r1 标题 / r2 空 / [返回行] / 信息行… / 空 / 条目（窗口滚动）
   const info = o.bodyInfo || [];
   const items = o.bodyItems || [];
-  const itemStart = 3 + info.length + 1;
+  const backRows = o.bodyBack ? 1 : 0;
+  const itemStart = 3 + backRows + info.length + 1;
   const itemAvail = Math.max(1, contentRows - itemStart);
   const bodyOffset = centerWindow(o.bodySel ?? 0, items.length, itemAvail);
 
-  const body = ['', '  ' + c.bold(c.cyan(o.bodyTitle || '')), ''];
+  const body = ['', '  ' + c.bold(c.cyan((o.bodyBack ? '‹ ' : '') + (o.bodyTitle || ''))), ''];
+  if (o.bodyBack) body.push('  ' + c.cyan('‹ 返回') + c.gray('（Esc / ← / 右键）'));
   for (const line of info) body.push('  ' + line);
   body.push('');
   for (let j = 0; j < itemAvail; j++) {
@@ -187,6 +191,7 @@ export function renderFrame(o) {
       navOffset,
       bodyItemY: 2 + itemStart, // 第一个条目的绝对行（1 起）
       bodyOffset,
+      backY: o.bodyBack ? 2 + 3 : 0,  // 「‹ 返回」行的绝对行（0 = 无）
     },
   };
 }
@@ -271,6 +276,7 @@ export function parseKeys(s) {
           if (m[4] === 'M') {
             if ((btn & 64) !== 0) out.push({ name: (btn & 1) ? 'wheelDown' : 'wheelUp' });
             else if ((btn & 3) === 0) out.push({ name: 'mouse', x: Number(m[2]), y: Number(m[3]) });
+            else if ((btn & 3) === 2) out.push({ name: 'rmb' }); // 右键 = 返回
           }
           i += m[0].length;
           continue;
@@ -283,6 +289,7 @@ export function parseKeys(s) {
       else if (two === '\x1b[D') { out.push({ name: 'left' }); i += 3; }
       else { out.push({ name: 'esc' }); i += 1; }
     } else if (ch === '\r' || ch === '\n') { out.push({ name: 'enter' }); i += 1; }
+    else if (ch === '\x7f') { out.push({ name: 'back' }); i += 1; } // 退格键 = 返回
     else if (ch === '\x03') { out.push({ name: 'ctrl-c' }); i += 1; }
     else if (ch === 'q' || ch === 'Q') { out.push({ name: 'quit' }); i += 1; }
     else if (ch === 'k') { out.push({ name: 'up' }); i += 1; }

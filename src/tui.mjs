@@ -625,9 +625,10 @@ async function dashboard() {
       bodyItems: t.items,
       bodySel: t.sel || 0,
       bodyFocused: !navFocused,
+      bodyBack: stack.length > 1,
       footerLeft: navFocused
         ? '↑/↓ 移动 · Enter/→ 进入 · 鼠标点击选择 · q 退出'
-        : '↑/↓ 选择 · Enter 执行 · Esc/← 返回 · q 退出',
+        : '↑/↓ 选择 · Enter 执行 · Esc/←/右键 返回 · q 退出',
       footerRight: CATS[cat].desc,
     });
     layout = out.layout;
@@ -690,9 +691,19 @@ async function dashboard() {
     await refreshRoot();
   }
 
-  /** 鼠标点击：左栏切分类（再点进 body），右栏选条目（再点执行） */
+  /** 返回上一级：子面板弹栈；根面板焦点回左栏 */
+  function goBack() {
+    if (focus !== 'body') return;
+    if (stack.length > 1) stack.pop();
+    else focus = 'nav';
+    statusMsg = null;
+    paint();
+  }
+
+  /** 鼠标点击：左栏切分类（再点进 body），右栏选条目（再点执行），「‹ 返回」行弹栈 */
   async function onMouse(k) {
     if (!layout) return;
+    if (layout.backY && k.y === layout.backY && k.x > layout.leftW) { goBack(); return; }
     if (k.x <= layout.leftW) {
       const i = layout.navOffset + (k.y - layout.navY);
       if (i < 0 || i >= CATS.length) return;
@@ -724,12 +735,9 @@ async function dashboard() {
     for (;;) {
       const k = await screen.key();
       if (k.name === 'quit' || k.name === 'ctrl-c') return;
-      if (k.name === 'esc' || k.name === 'left') {
+      if (k.name === 'esc' || k.name === 'left' || k.name === 'back' || k.name === 'rmb') {
         if (focus === 'body') {
-          if (stack.length > 1) stack.pop();
-          else focus = 'nav';
-          statusMsg = null;
-          paint();
+          goBack();
         } else if (k.name === 'esc') {
           return; // 左栏按 Esc = 退出
         }
