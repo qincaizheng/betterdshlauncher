@@ -22,6 +22,29 @@ async function prompt(cfg) {
   return enquirer.prompt(cfg);
 }
 
+/**
+ * 流程助手 { askText, askConfirm, exec }：
+ * - 仪表盘内：屏内输入框/确认行；exec 临时退出全屏跑输出型任务
+ * - 首次引导（普通模式）：enquirer 版本，exec 直接执行
+ */
+const normalHelpers = {
+  askText: async (o) => {
+    try {
+      const { v } = await prompt({ type: 'input', name: 'v', message: o.label + (o.hint ? '（' + o.hint + '）' : ''), ...(o.validate ? { validate: o.validate } : {}) });
+      return v == null ? null : String(v);
+    } catch (e) { if (isCancel(e)) return null; throw e; }
+  },
+  askConfirm: async (o) => {
+    try {
+      const { ok } = await prompt({ type: 'confirm', name: 'ok', message: o.label, initial: o.initial !== false });
+      return !!ok;
+    } catch (e) { if (isCancel(e)) return null; throw e; }
+  },
+  exec: async (fn) => {
+    try { await fn(); } catch (e) { if (!isCancel(e)) console.log('出错了：' + (e && e.message ? e.message : e)); }
+  },
+};
+
 /** 拆分空格分隔的包名列表（过滤空串） */
 function splitPkgs(s) {
   return String(s || '').trim().split(' ').filter(Boolean);
@@ -61,58 +84,62 @@ function summarizeManifest(text) {
   return o.name + ' v' + o.version + (o.description ? ' — ' + o.description : '') + '\nbundles(' + (o.bundles || []).length + '): ' + bundles;
 }
 
-/** 确认后安装（展示摘要 → 是/否 → installFromSource） */
-async function confirmInstall(text, source) {
-  console.log(summarizeManifest(text));
-  const { ok } = await prompt({ type: 'confirm', name: 'ok', message: '确认安装该整合包？', initial: true });
+/** 确认后安装（摘要 → 屏内确认 → exec 里跑安装） */
+async function confirmInstall(h, text, source) {
+  const ok = await h.askConfirm({ label: summarizeManifest(text).replace(/\n/g, '；') + ' — 确认安装？' });
   if (!ok) return;
-  try {
-    const r = await installFromSource(source);
-    console.log('安装成功：profile「' + r.profile + '」');
-  } catch (e) { console.log('安装失败：' + (e && e.message ? e.message : e)); }
+  await h.exec(async () => {
+    try {
+      const r = await installFromSource(source);
+      console.log('安装成功：profile「' + r.profile + '」');
+    } catch (e) { console.log('安装失败：' + (e && e.message ? e.message : e)); }
+  });
 }
 
-async function flowDownloadUrl() {
-  const { url } = await prompt({ type: 'input', name: 'url', message: 'bdl-pack.json 的 http(s)/file URL' });
-  if (!url) return;
-  const { sha } = await prompt({ type: 'input', name: 'sha', message: 'sha256（可选，回车跳过）' });
-  try {
-    const text = await fetchText(url.trim());
-    await confirmInstall(text, { type: 'url', url: url.trim(), ...(sha && sha.trim() ? { sha256: sha.trim() } : {}) });
-  } catch (e) { console.log('下载失败：' + (e && e.message ? e.message : e)); }
+async function flowDownloadUrl(h) {
+  const url = await h.askText({ label: 'bdl-pack.json 的 http(s)/file URL' });
+  if (!url || !url.trim()) return;
+  const sha = await h.askText({ label: 'sha256', hint: '可选，回车跳过' });
+  if (sha == null) return;
+  let text;
+  try { text = await fetchText(url.trim()); }
+  catch (e) { return '下载失败：' + (e && e.message ? e.message : e); }
+  await confirmInstall(h, text, { type: 'url', url: url.trim(), ...(sha && sha.trim() ? { sha256: sha.trim() } : {}) });
 }
 
-async function flowDownloadGit() {
-  const { repo } = await prompt({ type: 'input', name: 'repo', message: 'git 仓库 URL（https/git@）' });
-  if (!repo) return;
-  const { ref } = await prompt({ type: 'input', name: 'ref', message: '分支/tag（可选，回车默认）' });
-  try {
-    const got = await downloadFromGit(repo.trim(), (ref && ref.trim()) || undefined);
-    await confirmInstall(got.text, { type: 'git', url: repo.trim(), ...(ref && ref.trim() ? { ref: ref.trim() } : {}) });
-  } catch (e) { console.log('下载失败：' + (e && e.message ? e.message : e)); }
+async function flowDownloadGit(h) {
+  const repo = await h.askText({ label: 'git 仓库 URL（https/git@）' });
+  if (!repo || !repo.trim()) return;
+  const ref = await h.askText({ label: '分支/tag', hint: '可选，回车默认' });
+  if (ref == null) return;
+  let got;
+  try { got = await downloadFromGit(repo.trim(), (ref && ref.trim()) || undefined); }
+  catch (e) { return '下载失败：' + (e && e.message ? e.message : e); }
+  await confirmInstall(h, got.text, { type: 'git', url: repo.trim(), ...(ref && ref.trim() ? { ref: ref.trim() } : {}) });
 }
 
 /** 输 index URL 后返回「选包」下钻面板（由仪表盘在全屏内展示） */
-async function flowDownloadIndex() {
-  const { url } = await prompt({ type: 'input', name: 'url', message: 'index JSON 的 http(s)/file URL' });
-  if (!url) return;
+async function flowDownloadIndex(h) {
+  const url = await h.askText({ label: 'index JSON 的 http(s)/file URL' });
+  if (!url || !url.trim()) return;
   let packs;
   try {
     const idx = await loadIndex(url.trim());
     packs = searchPacks(idx.packs, '');
-  } catch (e) { console.log('下载失败：' + (e && e.message ? e.message : e)); return; }
-  if (!packs.length) { console.log('index 为空。'); return; }
+  } catch (e) { return '下载失败：' + (e && e.message ? e.message : e); }
+  if (!packs.length) return 'index 为空。';
   return {
     title: '选择整合包（' + packs.length + ' 个）',
     info: [],
     items: packs.filter((p) => p.url).map((p) => ({
       label: p.name + ' v' + p.version,
       hint: p.description || '',
-      run: async () => {
-        try {
-          const text = await fetchText(p.url);
-          await confirmInstall(text, { type: 'url', url: p.url, ...(p.sha256 ? { sha256: p.sha256 } : {}) });
-        } catch (e) { console.log('下载失败：' + (e && e.message ? e.message : e)); }
+      dialog: true,
+      run: async (h2) => {
+        let text;
+        try { text = await fetchText(p.url); }
+        catch (e) { return '下载失败：' + (e && e.message ? e.message : e); }
+        await confirmInstall(h2, text, { type: 'url', url: p.url, ...(p.sha256 ? { sha256: p.sha256 } : {}) });
       },
     })),
   };
@@ -127,12 +154,12 @@ async function bootstrapDownload() {
     choices: ['直链 URL', 'git 仓库', 'bdl-pack index', '返回'],
   });
   if (src === '直链 URL') {
-    await flowDownloadUrl();
+    await flowDownloadUrl(normalHelpers);
   } else if (src === 'git 仓库') {
-    await flowDownloadGit();
+    await flowDownloadGit(normalHelpers);
   } else if (src === 'bdl-pack index') {
-    const panel = await flowDownloadIndex();
-    if (panel && panel.items.length) {
+    const panel = await flowDownloadIndex(normalHelpers);
+    if (panel && panel.items && panel.items.length) {
       const { pick } = await prompt({
         type: 'autocomplete',
         name: 'pick',
@@ -140,40 +167,42 @@ async function bootstrapDownload() {
         choices: panel.items.map((it, i) => ({ name: String(i), message: it.label + (it.hint ? ' — ' + it.hint : '') })),
       });
       const it = panel.items[Number(pick)];
-      if (it && it.run) await it.run();
+      if (it && it.run) await it.run(normalHelpers);
+    } else if (typeof panel === 'string') {
+      console.log(panel);
     }
   }
 }
 
 // ---- 叶子流程（需要打字输入 / 大量输出，临时退出全屏执行） ---------------------
 
-async function flowCreatePack() {
-  const { name } = await prompt({
-    type: 'input',
-    name: 'name',
-    message: '新整合包（profile）名',
+async function flowCreatePack(h) {
+  const name = await h.askText({
+    label: '新整合包（profile）名',
     validate: (v) => isValidProfileName(v) ? true : '非法名字（不能含 / 或 \\、不能是 . .. node_modules）',
   });
-  if (!name) return;
-  const { pkgs } = await prompt({
-    type: 'input',
-    name: 'pkgs',
-    message: '要安装的 bundle 包名（空格分隔；回车默认 @deepseek-ai/dsh-base）',
-  });
+  if (name == null || !name.trim()) return;
+  const pkgs = await h.askText({ label: '要安装的 bundle 包名（空格分隔）', hint: '回车默认 @deepseek-ai/dsh-base' });
+  if (pkgs == null) return;
   const list = splitPkgs(pkgs);
   const addArgs = list.length ? list : ['@deepseek-ai/dsh-base'];
-  console.log('创建 profile「' + name + '」并安装：' + addArgs.join(' '));
-  const code = await runPlugin(name, ['add', ...addArgs]);
-  console.log('完成（退出码 ' + code + '）。');
+  const nm = name.trim();
+  await h.exec(async () => {
+    console.log('创建 profile「' + nm + '」并安装：' + addArgs.join(' '));
+    const code = await runPlugin(nm, ['add', ...addArgs]);
+    console.log('完成（退出码 ' + code + '）。');
+  });
 }
 
-async function flowImportPack() {
-  const { path } = await prompt({ type: 'input', name: 'path', message: 'bdl-pack.json 路径' });
-  if (!path) return;
-  try {
-    const r = await importPack(path.trim());
-    console.log('导入成功：profile「' + r.profile + '」（' + r.manifest.name + ' v' + r.manifest.version + '）');
-  } catch (e) { console.log('导入失败：' + (e && e.message ? e.message : e)); }
+async function flowImportPack(h) {
+  const path = await h.askText({ label: 'bdl-pack.json 路径' });
+  if (path == null || !path.trim()) return;
+  await h.exec(async () => {
+    try {
+      const r = await importPack(path.trim());
+      console.log('导入成功：profile「' + r.profile + '」（' + r.manifest.name + ' v' + r.manifest.version + '）');
+    } catch (e) { console.log('导入失败：' + (e && e.message ? e.message : e)); }
+  });
 }
 
 async function flowExportPack(profile) {
@@ -183,37 +212,55 @@ async function flowExportPack(profile) {
   } catch (e) { console.log('导出失败：' + (e && e.message ? e.message : e)); }
 }
 
-async function flowCopyPack(src) {
-  const { dst } = await prompt({ type: 'input', name: 'dst', message: '新整合包（profile）名', validate: (v) => isValidProfileName(v) ? true : '非法名字' });
-  if (!dst) return;
-  try { await copyProfile(src, dst); console.log('已复制为「' + dst + '」。'); }
-  catch (e) { console.log('复制失败：' + (e && e.message ? e.message : e)); }
+async function flowCopyPack(h, src) {
+  const dst = await h.askText({ label: '新整合包（profile）名', validate: (v) => isValidProfileName(v) ? true : '非法名字' });
+  if (dst == null || !dst.trim()) return;
+  const d = dst.trim();
+  await h.exec(async () => {
+    try { await copyProfile(src, d); console.log('已复制为「' + d + '」。'); }
+    catch (e) { console.log('复制失败：' + (e && e.message ? e.message : e)); }
+  });
 }
 
-async function flowRenamePack(src) {
-  const { dst } = await prompt({ type: 'input', name: 'dst', message: '新名字', validate: (v) => isValidProfileName(v) ? true : '非法名字' });
-  if (!dst) return;
-  try { await renameProfile(src, dst); console.log('已重命名为「' + dst + '」（建议校验一次）。'); }
-  catch (e) { console.log('重命名失败：' + (e && e.message ? e.message : e)); }
+async function flowRenamePack(h, src) {
+  const dst = await h.askText({ label: '新名字', validate: (v) => isValidProfileName(v) ? true : '非法名字' });
+  if (dst == null || !dst.trim()) return;
+  const d = dst.trim();
+  await h.exec(async () => {
+    try { await renameProfile(src, d); console.log('已重命名为「' + d + '」（建议校验一次）。'); }
+    catch (e) { console.log('重命名失败：' + (e && e.message ? e.message : e)); }
+  });
 }
 
-async function flowDeletePack(src) {
-  const { ok } = await prompt({ type: 'confirm', name: 'ok', message: '确认删除「' + src + '」？此操作不可恢复', initial: false });
+async function flowDeletePack(h, src) {
+  const ok = await h.askConfirm({ label: '确认删除「' + src + '」？此操作不可恢复', initial: false });
   if (!ok) return;
-  try { await deleteProfile(src); console.log('已删除「' + src + '」。'); }
-  catch (e) { console.log('删除失败：' + (e && e.message ? e.message : e)); }
+  await h.exec(async () => {
+    try { await deleteProfile(src); console.log('已删除「' + src + '」。'); }
+    catch (e) { console.log('删除失败：' + (e && e.message ? e.message : e)); }
+  });
 }
 
-async function flowPluginAdd(profile) {
-  const { pkgs } = await prompt({ type: 'input', name: 'pkgs', message: '要添加的包名（空格分隔）' });
+async function flowPluginAdd(h, profile) {
+  const pkgs = await h.askText({ label: '要添加的包名（空格分隔）' });
+  if (pkgs == null) return;
   const list = splitPkgs(pkgs);
-  if (list.length) { const code = await runPlugin(profile, ['add', ...list]); console.log('退出码 ' + code); }
+  if (!list.length) return;
+  await h.exec(async () => {
+    const code = await runPlugin(profile, ['add', ...list]);
+    console.log('退出码 ' + code);
+  });
 }
 
-async function flowPluginRemove(profile) {
-  const { pkgs } = await prompt({ type: 'input', name: 'pkgs', message: '要移除的包名（空格分隔）' });
+async function flowPluginRemove(h, profile) {
+  const pkgs = await h.askText({ label: '要移除的包名（空格分隔）' });
+  if (pkgs == null) return;
   const list = splitPkgs(pkgs);
-  if (list.length) { const code = await runPlugin(profile, ['remove', ...list]); console.log('退出码 ' + code); }
+  if (!list.length) return;
+  await h.exec(async () => {
+    const code = await runPlugin(profile, ['remove', ...list]);
+    console.log('退出码 ' + code);
+  });
 }
 
 async function flowCheckUpdates(profile) {
@@ -228,30 +275,53 @@ async function flowCheckUpdates(profile) {
   else for (const i of link.items) console.log('• ' + i.name + '  落后 ' + i.behind + ' 个提交（' + i.dir + '）');
 }
 
-async function flowBatchUpdate(profile) {
+/** 批量更新：可勾选面板（Enter 勾选/取消，「执行选中的更新」统一跑） */
+async function batchUpdatePanel(profile) {
   const reg = await checkRegistryUpdates(profile);
   const link = await checkLinkUpdates(profile);
-  const choices = [
-    ...reg.items.map((i) => ({ name: 'reg:' + i.name, message: i.name + '（registry ' + i.current + ' → ' + i.latest + '）' })),
-    ...link.items.map((i) => ({ name: 'link:' + i.name, message: i.name + '（git 落后 ' + i.behind + '）' })),
+  const state = [
+    ...reg.items.map((i) => ({ kind: 'reg', name: i.name, label: i.name + '（registry ' + i.current + ' → ' + i.latest + '）', checked: false })),
+    ...link.items.map((i) => ({ kind: 'link', name: i.name, label: i.name + '（git 落后 ' + i.behind + '）', checked: false })),
   ];
-  if (!choices.length) { console.log('无可更新项。'); return; }
-  const { selected } = await prompt({ type: 'multiselect', name: 'selected', message: '选择要更新的项（空格切换，回车提交）', choices });
-  if (!selected || !selected.length) return;
-  for (const s of selected) {
-    const [kind, name] = s.split(/:(.*)/s);
-    if (kind === 'reg') { console.log('更新 ' + name + ' …'); await updateRegistryPkgs(profile, [name]); }
-    else { console.log('git pull ' + name + ' …'); try { await updateLinkPkg(profile, name); } catch (e) { console.log(String(e && e.message || e)); } }
-  }
-  console.log('批量更新完成。');
+  if (!state.length) return { title: '批量更新（' + profile + '）', info: [c.gray('无可更新项')], items: [] };
+  const items = state.map((s) => {
+    const item = {
+      label: s.label,
+      hint: '[ ]',
+      inline: true,
+      run: async () => {
+        s.checked = !s.checked;
+        item.hint = s.checked ? c.green('[x]') : '[ ]';
+        return (s.checked ? '已选中 ' : '已取消 ') + s.name;
+      },
+    };
+    return item;
+  });
+  items.unshift({
+    label: '执行选中的更新',
+    hint: 'pnpm / git pull',
+    dialog: true,
+    run: (h) => h.exec(async () => {
+      const sel = state.filter((s) => s.checked);
+      if (!sel.length) { console.log('未选中任何项。'); return; }
+      for (const s of sel) {
+        if (s.kind === 'reg') { console.log('更新 ' + s.name + ' …'); await updateRegistryPkgs(profile, [s.name]); }
+        else { console.log('git pull ' + s.name + ' …'); try { await updateLinkPkg(profile, s.name); } catch (e) { console.log(String(e && e.message || e)); } }
+      }
+      console.log('批量更新完成。');
+    }),
+  });
+  return { title: '批量更新（' + profile + '）', info: [c.gray('Enter 勾选/取消；选「执行选中的更新」开始')], items };
 }
 
-async function flowInstallOne(v) {
-  const { ok } = await prompt({ type: 'confirm', name: 'ok', message: '将下载约 529 包 / 334MB，确认安装 ' + v + '？', initial: true });
+async function flowInstallOne(h, v) {
+  const ok = await h.askConfirm({ label: '将下载约 529 包 / 334MB，确认安装 ' + v + '？', initial: true });
   if (!ok) return;
-  console.log('安装 ' + v + '（可能需要数分钟，进度实时显示）…');
-  try { const bin = await installVersion(v); console.log('安装完成：' + bin); }
-  catch (e) { console.log('安装失败：' + (e && e.message ? e.message : e)); }
+  await h.exec(async () => {
+    console.log('安装 ' + v + '（可能需要数分钟，进度实时显示）…');
+    try { const bin = await installVersion(v); console.log('安装完成：' + bin); }
+    catch (e) { console.log('安装失败：' + (e && e.message ? e.message : e)); }
+  });
 }
 
 function flowShowManualInstall(v) {
@@ -278,7 +348,7 @@ async function installVersionPanel() {
         title: '安装 ' + v,
         info: [c.gray('约 529 包 / 334MB / 2 分钟')],
         items: [
-          { label: '一键安装（推荐）', hint: 'bdl 代跑 npm', run: () => flowInstallOne(v) },
+          { label: '一键安装（推荐）', hint: 'bdl 代跑 npm', dialog: true, run: (h) => flowInstallOne(h, v) },
           { label: '显示手动安装命令', run: () => flowShowManualInstall(v) },
         ],
       }),
@@ -364,11 +434,13 @@ async function flowLaunchEnv(profile) {
   console.log('（隔离会话已退出，码 ' + code + '）');
 }
 
-async function flowDeleteEnv(name) {
-  const { ok } = await prompt({ type: 'confirm', name: 'ok', message: '确认删除隔离环境「' + name + '」？', initial: false });
+async function flowDeleteEnv(h, name) {
+  const ok = await h.askConfirm({ label: '确认删除隔离环境「' + name + '」？', initial: false });
   if (!ok) return;
-  await removeIsolatedEnv(name);
-  console.log('已删除 ' + name);
+  await h.exec(async () => {
+    await removeIsolatedEnv(name);
+    console.log('已删除 ' + name);
+  });
 }
 
 async function flowVerify(profile) {
@@ -393,26 +465,25 @@ async function flowTailLog(name) {
   catch (e) { console.log('读取失败：' + (e && e.message ? e.message : e)); }
 }
 
-async function flowSetExtraArgs(profile) {
+async function flowSetExtraArgs(h, profile) {
   const meta = await loadMeta();
   const cur = (meta.bundles && meta.bundles[profile] && meta.bundles[profile].extraArgs) || [];
-  const { args } = await prompt({ type: 'input', name: 'args', message: '启动参数（空格分隔，回车清空）当前：' + cur.join(' ') });
+  const args = await h.askText({ label: '启动参数（空格分隔，回车清空）', hint: '当前：' + (cur.join(' ') || '（无）'), initial: cur.join(' ') });
+  if (args == null) return;
   const next = splitPkgs(args);
   if (!meta.bundles) meta.bundles = {};
   if (!meta.bundles[profile]) meta.bundles[profile] = { id: profile, name: profile, profile };
   meta.bundles[profile].extraArgs = next;
   await saveMeta(meta);
-  console.log('已保存：' + next.join(' '));
+  return '已保存：' + (next.join(' ') || '（已清空）');
 }
 
-async function flowSetNpmrc(profile) {
+async function flowSetNpmrc(h, profile) {
   const cur = await readNpmrc(profile);
-  console.log('当前 .npmrc：' + (cur || '（未设置，用全局 npm 配置）'));
-  const { url } = await prompt({ type: 'input', name: 'url', message: 'registry URL（如 https://registry.npmmirror.com；回车跳过）' });
-  if (url && url.trim()) {
-    await writeNpmrc(profile, url.trim());
-    console.log('已写入 ' + url.trim());
-  }
+  const url = await h.askText({ label: 'registry URL', hint: '当前：' + (cur || '（未设置，用全局 npm 配置）') + '；回车跳过' });
+  if (url == null || !url.trim()) return;
+  await writeNpmrc(profile, url.trim());
+  return '已写入 ' + url.trim();
 }
 
 // ---- 面板构建（body 内容；选择类操作全部内联） --------------------------------
@@ -491,10 +562,10 @@ async function pluginOpsPanel(profile) {
         },
       },
       { label: '启用/禁用', hint: 'Enter 直接切换', children: () => bundleTogglePanel(profile) },
-      { label: '添加 bundle', run: () => flowPluginAdd(profile) },
-      { label: '移除 bundle', run: () => flowPluginRemove(profile) },
+      { label: '添加 bundle', dialog: true, run: (h) => flowPluginAdd(h, profile) },
+      { label: '移除 bundle', dialog: true, run: (h) => flowPluginRemove(h, profile) },
       { label: '更新检查', hint: 'registry + git', run: () => flowCheckUpdates(profile) },
-      { label: '批量更新', hint: '勾选后执行', run: () => flowBatchUpdate(profile) },
+      { label: '批量更新', hint: '勾选后执行', children: () => batchUpdatePanel(profile) },
     ],
   };
 }
@@ -537,24 +608,24 @@ const CATS = [
             }),
           })),
         },
-        { label: '新建整合包', hint: '手动选插件', run: flowCreatePack },
+        { label: '新建整合包', hint: '手动选插件', dialog: true, run: flowCreatePack },
         {
           label: '下载整合包', hint: 'URL / git / index',
           children: () => ({
             title: '下载整合包 — 选择来源',
             info: [],
             items: [
-              { label: '直链 URL', hint: 'bdl-pack.json 的 http(s)/file 地址', run: flowDownloadUrl },
-              { label: 'git 仓库', hint: 'https/git@ 仓库', run: flowDownloadGit },
-              { label: 'bdl-pack index', hint: '从索引里挑选', run: flowDownloadIndex },
+              { label: '直链 URL', hint: 'bdl-pack.json 的 http(s)/file 地址', dialog: true, run: flowDownloadUrl },
+              { label: 'git 仓库', hint: 'https/git@ 仓库', dialog: true, run: flowDownloadGit },
+              { label: 'bdl-pack index', hint: '从索引里挑选', dialog: true, run: flowDownloadIndex },
             ],
           }),
         },
-        { label: '导入整合包', hint: '本地 bdl-pack.json', run: flowImportPack },
+        { label: '导入整合包', hint: '本地 bdl-pack.json', dialog: true, run: flowImportPack },
         { label: '导出整合包', children: async () => profilesPanel(await gatherContext(), '选择要导出的整合包', (p) => ({ run: () => flowExportPack(p.name) })) },
-        { label: '复制整合包', children: async () => profilesPanel(await gatherContext(), '选择要复制的整合包', (p) => ({ run: () => flowCopyPack(p.name) })) },
-        { label: '重命名整合包', children: async () => profilesPanel(await gatherContext(), '选择要重命名的整合包', (p) => ({ run: () => flowRenamePack(p.name) })) },
-        { label: '删除整合包', hint: '不可恢复', children: async () => profilesPanel(await gatherContext(), '选择要删除的整合包', (p) => ({ run: () => flowDeletePack(p.name) })) },
+        { label: '复制整合包', children: async () => profilesPanel(await gatherContext(), '选择要复制的整合包', (p) => ({ dialog: true, run: (h) => flowCopyPack(h, p.name) })) },
+        { label: '重命名整合包', children: async () => profilesPanel(await gatherContext(), '选择要重命名的整合包', (p) => ({ dialog: true, run: (h) => flowRenamePack(h, p.name) })) },
+        { label: '删除整合包', hint: '不可恢复', children: async () => profilesPanel(await gatherContext(), '选择要删除的整合包', (p) => ({ dialog: true, run: (h) => flowDeletePack(h, p.name) })) },
       ],
     }),
   },
@@ -616,7 +687,7 @@ const CATS = [
       items: [
         { label: '创建隔离环境', children: async () => profilesPanel(await gatherContext(), '选择要隔离的整合包', (p) => ({ run: () => flowCreateEnv(p.name) })) },
         { label: '在隔离环境启动', children: () => envsPanel('选择要启动的隔离环境', (e) => ({ run: () => flowLaunchEnv(e) })) },
-        { label: '删除隔离环境', children: () => envsPanel('选择要删除的隔离环境', (e) => ({ run: () => flowDeleteEnv(e) })) },
+        { label: '删除隔离环境', children: () => envsPanel('选择要删除的隔离环境', (e) => ({ dialog: true, run: (h) => flowDeleteEnv(h, e) })) },
       ],
     }),
   },
@@ -652,8 +723,8 @@ const CATS = [
             run: async () => { await setDefaultProfile(p.name); return '默认整合包已设为 ' + p.name; },
           })),
         },
-        { label: '启动参数（extraArgs）', children: async () => profilesPanel(await gatherContext(), '选择整合包', (p) => ({ run: () => flowSetExtraArgs(p.name) })) },
-        { label: '镜像源（profile .npmrc）', children: async () => profilesPanel(await gatherContext(), '选择整合包', (p) => ({ run: () => flowSetNpmrc(p.name) })) },
+        { label: '启动参数（extraArgs）', children: async () => profilesPanel(await gatherContext(), '选择整合包', (p) => ({ dialog: true, run: (h) => flowSetExtraArgs(h, p.name) })) },
+        { label: '镜像源（profile .npmrc）', children: async () => profilesPanel(await gatherContext(), '选择整合包', (p) => ({ dialog: true, run: (h) => flowSetNpmrc(h, p.name) })) },
       ],
     }),
   },
@@ -678,8 +749,85 @@ async function dashboard() {
   let statusMsg = null;
   let loadSeq = 0;
   let layout = null;
+  let inputState = null; // 屏内输入模态：{ kind:'text'|'confirm', label, hint, cps, cursor, validate, initial, resolve }
+  let busy = false;      // dialog 流程执行中（屏内输入/确认/exec）时屏蔽导航键与鼠标
 
   const top = () => stack[stack.length - 1];
+
+  // ---- 屏内输入（lazygit 风格，不离开全屏） ----
+
+  function askText(o) {
+    return new Promise((resolve) => {
+      const cps = [...(o.initial || '')];
+      inputState = { kind: 'text', label: o.label, hint: o.hint || '', validate: o.validate, cps, cursor: cps.length, resolve };
+      screen.inputMode = true;
+      paint();
+    });
+  }
+
+  function askConfirm(o) {
+    return new Promise((resolve) => {
+      inputState = { kind: 'confirm', label: o.label, initial: o.initial !== false, resolve };
+      screen.inputMode = true;
+      paint();
+    });
+  }
+
+  function settleInput(value) {
+    const s = inputState;
+    inputState = null;
+    screen.inputMode = false;
+    statusMsg = null;
+    paint();
+    s.resolve(value);
+  }
+
+  function handleInputKey(k) {
+    const s = inputState;
+    if (!s) return;
+    if (s.kind === 'confirm') {
+      if (k.name === 'enter') return settleInput(s.initial);
+      if (k.name === 'esc' || k.name === 'ctrl-c') return settleInput(null);
+      if (k.name === 'text' && (k.text === 'y' || k.text === 'Y')) return settleInput(true);
+      if (k.name === 'text' && (k.text === 'n' || k.text === 'N')) return settleInput(false);
+      return;
+    }
+    if (k.name === 'text') {
+      const cps = [...k.text];
+      s.cps.splice(s.cursor, 0, ...cps);
+      s.cursor += cps.length;
+      paint();
+    } else if (k.name === 'back') {
+      if (s.cursor > 0) { s.cps.splice(s.cursor - 1, 1); s.cursor--; paint(); }
+    } else if (k.name === 'left') {
+      if (s.cursor > 0) { s.cursor--; paint(); }
+    } else if (k.name === 'right') {
+      if (s.cursor < s.cps.length) { s.cursor++; paint(); }
+    } else if (k.name === 'esc' || k.name === 'ctrl-c') {
+      settleInput(null);
+    } else if (k.name === 'enter') {
+      const v = s.cps.join('');
+      if (s.validate) {
+        const r = s.validate(v.trim());
+        if (r !== true) { statusMsg = String(r); paint(); return; }
+      }
+      settleInput(v);
+    }
+  }
+
+  /** dialog 流程的助手：屏内输入/确认 + exec 临时退出全屏跑输出型任务 */
+  const helpers = {
+    askText,
+    askConfirm,
+    exec: async (fn) => {
+      screen.exit();
+      try { await fn(); }
+      catch (e) { if (!isCancel(e)) console.log('出错了：' + (e && e.message ? e.message : e)); }
+      await waitKey();
+      screen.enter();
+      paint();
+    },
+  };
 
   function paint() {
     const t = top() || { title: '', info: [], items: [], sel: 0 };
@@ -698,6 +846,7 @@ async function dashboard() {
       bodyItems: t.items,
       bodySel: t.sel || 0,
       bodyFocused: !navFocused,
+      bodyInput: inputState,
       bodyBack: stack.length > 1,
       footerLeft: navFocused
         ? '↑/↓ 移动 · Enter/→ 进入 · 鼠标点击选择 · q 退出'
@@ -727,7 +876,29 @@ async function dashboard() {
     paint();
   }
 
-  /** 执行一个面板条目；返回 'exit' 表示结束整个 TUI */
+  let exitReq = false;
+  const busyWaiters = [];
+
+  /** 触发条目（不 await）：busy 期间忽略新触发；'exit' 结果通过 exitReq 传递 */
+  function tryActivate(item) {
+    if (!item || busy || inputState) return;
+    busy = true;
+    Promise.resolve(activate(item))
+      .then((v) => { if (v === 'exit') exitReq = true; })
+      .catch((e) => { statusMsg = '出错了：' + (e && e.message ? e.message : e); paint(); })
+      .finally(() => {
+        busy = false;
+        for (const w of busyWaiters.splice(0)) w(); // 唤醒被 busy 挡住的按键
+      });
+  }
+
+  /** busy 期间按键不丢弃：等流程收尾完成后重新处理 */
+  function waitNotBusy() {
+    if (!busy) return Promise.resolve();
+    return new Promise((res) => busyWaiters.push(res));
+  }
+
+  /** 执行一个面板条目；返回 'exit' 表示结束整个 TUI。只由 tryActivate 调用。 */
   async function activate(item) {
     if (!item) return;
     statusMsg = null;
@@ -739,6 +910,27 @@ async function dashboard() {
       return;
     }
     if (!item.run) return;
+    if (item.dialog) {
+      // 对话流程：屏内收集输入，只有长输出才经 helpers.exec 离开全屏
+      // 注意：由 tryActivate 调用（不 await），否则屏内输入永远等不到按键（死锁）
+      const r = await item.run(helpers);
+      if (r === 'exit') return 'exit';
+      if (r && typeof r === 'object' && Array.isArray(r.items)) {
+        r.sel = 0;
+        stack.push(r);
+        paint();
+        return;
+      }
+      if (typeof r === 'string') statusMsg = r;
+      // 对话可能改了状态：刷新当前分类根面板，焦点留在 body
+      ctx = await gatherContext();
+      const p = await CATS[cat].panel(ctx);
+      p.sel = 0;
+      stack = [p];
+      focus = p.items.length ? 'body' : 'nav';
+      paint();
+      return;
+    }
     if (item.inline) {
       // 内联操作：不离开全屏，结果显示在状态行，面板原地刷新
       try { statusMsg = (await item.run()) || null; }
@@ -783,7 +975,7 @@ async function dashboard() {
 
   /** 鼠标点击：左栏切分类（再点进 body），右栏选条目（再点执行），「‹ 返回」行弹栈 */
   async function onMouse(k) {
-    if (!layout) return;
+    if (!layout || busy || inputState) return;
     if (layout.backY && k.y === layout.backY && k.x > layout.leftW) { goBack(); return; }
     if (k.x <= layout.leftW) {
       const i = layout.navOffset + (k.y - layout.navY);
@@ -803,7 +995,7 @@ async function dashboard() {
     if (!t || !t.items.length) return;
     const i = layout.bodyOffset + (k.y - layout.bodyItemY);
     if (i < 0 || i >= t.items.length) return;
-    if (i === t.sel && focus === 'body') return activate(t.items[i]);
+    if (i === t.sel && focus === 'body') { tryActivate(t.items[i]); return; }
     t.sel = i;
     focus = 'body';
     paint();
@@ -815,6 +1007,10 @@ async function dashboard() {
   try {
     for (;;) {
       const k = await screen.key();
+      if (inputState) { handleInputKey(k); if (exitReq) return; continue; } // 输入模态最优先（此时 busy 为 true，不能被 busy 挡）
+      if (busy) await waitNotBusy(); // 流程收尾期间到来的按键等收尾后再处理（含 q / Esc）
+      if (exitReq) return;
+      if (busy) continue;
       if (k.name === 'quit' || k.name === 'ctrl-c') return;
       if (k.name === 'esc' || k.name === 'left' || k.name === 'back' || k.name === 'rmb') {
         if (focus === 'body') {
@@ -850,14 +1046,12 @@ async function dashboard() {
           if (CATS[cat].id === 'quit') return;
           if (top() && top().items.length) { focus = 'body'; paint(); }
         } else {
-          const r = await activate(top().items[top().sel || 0]);
-          if (r === 'exit') return;
+          tryActivate(top().items[top().sel || 0]);
         }
         continue;
       }
       if (k.name === 'mouse') {
-        const r = await onMouse(k);
-        if (r === 'exit') return;
+        await onMouse(k);
       }
     }
   } finally {
@@ -884,9 +1078,9 @@ export async function runTui() {
       if (first === '下载整合包（URL / git / index）') {
         await bootstrapDownload();
       } else if (first === '导入本地 bdl-pack.json') {
-        await flowImportPack();
+        await flowImportPack(normalHelpers);
       } else if (first === '新建整合包（手动选插件）') {
-        await flowCreatePack();
+        await flowCreatePack(normalHelpers);
       } else {
         return;
       }

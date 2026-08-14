@@ -1,5 +1,6 @@
 // src/ui/frame.mjs — 零依赖全屏 TUI 渲染层：header / 左侧导航 / body 面板 / footer
-// 仅使用 ANSI 转义序列；CJK 宽字符对齐、SGR 鼠标（点击 + 滚轮）、NO_COLOR、SIGWINCH 重绘。
+// 仅使用 ANSI 转义序列；CJK 宽字符对齐、SGR 鼠标（点击 + 滚轮）、屏内文本输入、NO_COLOR、SIGWINCH 重绘。
+import { StringDecoder } from 'node:string_decoder';
 
 const ESC = '\x1b[';
 
@@ -97,6 +98,7 @@ function centerWindow(sel, len, avail) {
  *   navCaption, menu: [{ label }], selected, navFocused,
  *   bodyTitle, bodyInfo: [string],
  *   bodyItems: [{ label, hint? }], bodySel, bodyFocused,
+ *   bodyInput,                          // 屏内输入：{ kind:'text'|'confirm', label, hint?, cps?, cursor?, initial? }（激活时隐藏条目）
  *   bodyBack,                           // 子面板：渲染可点击的「‹ 返回」行
  *   footerLeft, footerRight,
  * }
@@ -143,14 +145,31 @@ export function renderFrame(o) {
   // ---- 右栏（body 面板） ----
   // 内容行布局：r0 空 / r1 标题 / r2 空 / [返回行] / 信息行… / 空 / 条目（窗口滚动）
   const info = o.bodyInfo || [];
-  const items = o.bodyItems || [];
+  const bi = o.bodyInput || null;
+  const items = bi ? [] : (o.bodyItems || []); // 输入激活时隐藏条目
   const backRows = o.bodyBack ? 1 : 0;
-  const itemStart = 3 + backRows + info.length + 1;
+  const inputRows = bi ? 2 + (bi.hint ? 1 : 0) : 0;
+  const itemStart = 3 + backRows + inputRows + info.length + 1;
   const itemAvail = Math.max(1, contentRows - itemStart);
   const bodyOffset = centerWindow(o.bodySel ?? 0, items.length, itemAvail);
 
   const body = ['', '  ' + c.bold(c.cyan((o.bodyBack ? '‹ ' : '') + (o.bodyTitle || ''))), ''];
   if (o.bodyBack) body.push('  ' + c.cyan('‹ 返回') + c.gray('（Esc / ← / 右键）'));
+  if (bi) {
+    let disp;
+    if (bi.kind === 'confirm') {
+      disp = c.yellow('? ') + bi.label + ' ' + c.bold(bi.initial ? '(Y/n)' : '(y/N)');
+    } else {
+      const cps = bi.cps || [];
+      const before = cps.slice(0, bi.cursor).join('');
+      const at = cps[bi.cursor] || ' ';
+      const after = cps.slice(bi.cursor + 1).join('');
+      disp = c.yellow('? ') + bi.label + ' ' + before + highlight(at) + after;
+    }
+    body.push('  ' + disp);
+    if (bi.hint) body.push('    ' + c.gray(bi.hint));
+    body.push('');
+  }
   for (const line of info) body.push('  ' + line);
   body.push('');
   for (let j = 0; j < itemAvail; j++) {
@@ -210,9 +229,11 @@ export class Screen {
     this.stdout = stdout;
     this.stdin = stdin;
     this.onResize = null;
+    this.inputMode = false; // true 时普通字符解析为文本输入（q/j/k/数字等不再是快捷键）
     this._waiters = [];
-    this._queue = [];
+    this._raw = ''; // 未消费的原始输入（解析按提取时的 inputMode 逐个进行）
     this._entered = false;
+    this._decoder = new StringDecoder('utf8'); // 防止多字节字符被 data 分片切断
     this._onData = (buf) => this._handle(buf);
     this._onSigwinch = () => { if (this.onResize) this.onResize(); };
   }
@@ -247,57 +268,88 @@ export class Screen {
   }
 
   key() {
-    const k = this._queue.shift();
-    if (k) return Promise.resolve(k);
+    for (;;) {
+      const one = parseOne(this._raw, this.inputMode);
+      if (!one) break;
+      this._raw = this._raw.slice(one.consumed);
+      if (one.key) return Promise.resolve(one.key); // null key（鼠标松开/未识别）继续提取
+    }
     return new Promise((resolve) => this._waiters.push(resolve));
   }
 
   _handle(buf) {
-    const keys = parseKeys(buf.toString('utf8'));
-    for (const k of keys) {
-      const w = this._waiters.shift();
-      if (w) w(k);
-      else this._queue.push(k); // 没有等待者时排队，避免连发按键丢失
+    this._raw += this._decoder.write(buf);
+    this._drain();
+  }
+
+  _drain() {
+    // 逐个提取按键：inputMode 在每次提取时读取，输入模态切换不影响同一数据块内后续的键
+    for (;;) {
+      if (!this._waiters.length || !this._raw) break;
+      const one = parseOne(this._raw, this.inputMode);
+      if (!one) break; // 不完整的转义序列，等更多数据
+      this._raw = this._raw.slice(one.consumed);
+      if (one.key) this._waiters.shift()(one.key); // null key（鼠标松开/未识别）：消费后继续
     }
   }
 }
 
-export function parseKeys(s) {
+/**
+ * 从输入串头部提取一个按键/鼠标事件。input = true 为文本输入模式：
+ * 方向键/Enter/Esc/退格/Ctrl-C 仍是命令，其余可打印字符（含 CJK、数字、q/j/k）解析为 { name:'text', text }。
+ * 返回 { key, consumed }；输入为空或转义序列不完整时返回 null（等更多数据）。
+ */
+export function parseOne(s, input) {
+  if (!s) return null;
+  const ch = s[0];
+  const key = (k, consumed) => ({ key: k, consumed });
+  if (ch === '\x1b') {
+    // SGR 鼠标：\x1b[<btn;x;yM（按下）/ m（松开）
+    if (s[1] === '[' && s[2] === '<') {
+      const m = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])/.exec(s);
+      if (!m) return /^\x1b\[<[\d;]*$/.test(s) ? null : key({ name: 'esc' }, 1); // 不完整则等更多数据
+      const btn = Number(m[1]);
+      if (m[4] !== 'M') return key(null, m[0].length); // 松开事件：消费但不产生按键
+      if ((btn & 64) !== 0) return key({ name: (btn & 1) ? 'wheelDown' : 'wheelUp' }, m[0].length);
+      if ((btn & 3) === 0) return key({ name: 'mouse', x: Number(m[2]), y: Number(m[3]) }, m[0].length);
+      if ((btn & 3) === 2) return key({ name: 'rmb' }, m[0].length); // 右键 = 返回
+      return key(null, m[0].length);
+    }
+    if (s.length === 1) return key({ name: 'esc' }, 1); // 裸 Esc（不与方向键消歧，实践中方向键整块到达）
+    if (s === '\x1b[') return null; // 可能是被分片的方向键
+    const two = s.slice(0, 3);
+    if (two === '\x1b[A') return key({ name: 'up' }, 3);
+    if (two === '\x1b[B') return key({ name: 'down' }, 3);
+    if (two === '\x1b[C') return key({ name: 'right' }, 3);
+    if (two === '\x1b[D') return key({ name: 'left' }, 3);
+    return key({ name: 'esc' }, 1);
+  }
+  if (ch === '\r' || ch === '\n') return key({ name: 'enter' }, 1);
+  if (ch === '\x7f') return key({ name: 'back' }, 1); // 退格键 = 返回 / 删字
+  if (ch === '\x03') return key({ name: 'ctrl-c' }, 1);
+  if (input) {
+    if (ch >= ' ' || ch > '\x7f') return key({ name: 'text', text: ch }, 1); // 可打印字符（含 CJK）
+    return key(null, 1); // 其余控制字符：丢弃
+  }
+  if (ch === 'q' || ch === 'Q') return key({ name: 'quit' }, 1);
+  if (ch === 'k') return key({ name: 'up' }, 1);
+  if (ch === 'j') return key({ name: 'down' }, 1);
+  if (ch === 'h') return key({ name: 'left' }, 1);
+  if (ch === 'l') return key({ name: 'right' }, 1);
+  if (ch >= '1' && ch <= '9') return key({ name: 'num', n: Number(ch) }, 1);
+  return key(null, 1); // 未识别：丢弃
+}
+
+/** 批量解析（测试与调试用）；inputMode 固定为 opts.input */
+export function parseKeys(s, opts) {
+  const input = !!(opts && opts.input);
   const out = [];
-  let i = 0;
-  while (i < s.length) {
-    const ch = s[i];
-    if (ch === '\x1b') {
-      // SGR 鼠标：\x1b[<btn;x;yM（按下）/ m（松开）
-      if (s[i + 1] === '[' && s[i + 2] === '<') {
-        const m = /\x1b\[<(\d+);(\d+);(\d+)([Mm])/.exec(s.slice(i));
-        if (m) {
-          const btn = Number(m[1]);
-          if (m[4] === 'M') {
-            if ((btn & 64) !== 0) out.push({ name: (btn & 1) ? 'wheelDown' : 'wheelUp' });
-            else if ((btn & 3) === 0) out.push({ name: 'mouse', x: Number(m[2]), y: Number(m[3]) });
-            else if ((btn & 3) === 2) out.push({ name: 'rmb' }); // 右键 = 返回
-          }
-          i += m[0].length;
-          continue;
-        }
-      }
-      const two = s.slice(i, i + 3);
-      if (two === '\x1b[A') { out.push({ name: 'up' }); i += 3; }
-      else if (two === '\x1b[B') { out.push({ name: 'down' }); i += 3; }
-      else if (two === '\x1b[C') { out.push({ name: 'right' }); i += 3; }
-      else if (two === '\x1b[D') { out.push({ name: 'left' }); i += 3; }
-      else { out.push({ name: 'esc' }); i += 1; }
-    } else if (ch === '\r' || ch === '\n') { out.push({ name: 'enter' }); i += 1; }
-    else if (ch === '\x7f') { out.push({ name: 'back' }); i += 1; } // 退格键 = 返回
-    else if (ch === '\x03') { out.push({ name: 'ctrl-c' }); i += 1; }
-    else if (ch === 'q' || ch === 'Q') { out.push({ name: 'quit' }); i += 1; }
-    else if (ch === 'k') { out.push({ name: 'up' }); i += 1; }
-    else if (ch === 'j') { out.push({ name: 'down' }); i += 1; }
-    else if (ch === 'h') { out.push({ name: 'left' }); i += 1; }
-    else if (ch === 'l') { out.push({ name: 'right' }); i += 1; }
-    else if (ch >= '1' && ch <= '9') { out.push({ name: 'num', n: Number(ch) }); i += 1; }
-    else { i += 1; }
+  let rest = s;
+  for (;;) {
+    const one = parseOne(rest, input);
+    if (!one) break;
+    rest = rest.slice(one.consumed);
+    if (one.key) out.push(one.key);
   }
   return out;
 }
