@@ -1,7 +1,7 @@
 // src/tui.mjs — 全屏仪表盘 TUI：header / 左侧导航 / body 面板（鼠标 + 键盘两级导航）
 // 选择类操作全部在右栏面板内完成；仅需要打字输入/大量输出的流程临时退出全屏。
 import Enquirer from 'enquirer';
-import { discoverProfiles, listBundles, isValidProfileName, defaultDshVersion, profileDshVersion, defaultProfile, setDefaultProfile, writeNpmrc, readNpmrc, loadMeta, saveMeta, metaPath, versionsDir } from './registry.mjs';
+import { discoverProfiles, listBundles, isValidProfileName, defaultDshVersion, profileDshVersion, defaultProfile, setDefaultProfile, writeNpmrc, readNpmrc, loadMeta, saveMeta, versionsDir } from './registry.mjs';
 import { remoteVersions, installedVersions, systemVersion, installVersion, removeVersion, setDefault, setProfileLock, resolveForProfile } from './dsh-version.mjs';
 import { runPlugin } from './dsh.mjs';
 import { importPack, exportPack } from './pack.mjs';
@@ -396,7 +396,7 @@ async function lockVersionPanel(profile) {
   const build = async () => lockVersionPanel(profile);
   return {
     title: '选择 ' + profile + ' 锁定的版本',
-    info: [c.gray('当前：' + profileDshVersion(profile))],
+    info: [c.gray('当前：' + (profileDshVersion(profile) || '跟随默认'))],
     rebuild: build,
     items: [
       { label: '跟随默认（解除锁定）', inline: true, run: async () => { await setProfileLock(profile, null); return profile + ' 已解除锁定，跟随默认'; } },
@@ -500,6 +500,32 @@ async function gatherContext() {
   };
 }
 
+/** 面板条目工具：section 为不可选中的分节标题 */
+function nextSel(items, from, d) {
+  if (!items.length) return 0;
+  let i = from;
+  for (let n = 0; n < items.length; n++) {
+    i = (i + d + items.length) % items.length;
+    if (!items[i].section) return i;
+  }
+  return from;
+}
+
+function firstSel(items) {
+  const i = items.findIndex((it) => !it.section);
+  return i < 0 ? 0 : i;
+}
+
+/** 第 n 个可选中条目的实际下标（1 起）；超出返回 -1 */
+function nthSel(items, n) {
+  let seen = 0;
+  for (let i = 0; i < items.length; i++) {
+    if (items[i].section) continue;
+    if (++seen === n) return i;
+  }
+  return -1;
+}
+
 /** profile 列表 → 面板条目（make(p) 返回 { run } / { children } / { inline, run }） */
 function profileItems(ctx, make) {
   return ctx.profiles.map((p) => ({
@@ -544,35 +570,66 @@ async function bundleTogglePanel(profile) {
   };
 }
 
-async function pluginOpsPanel(profile) {
+async function bundleListPanel(profile) {
+  const list = await listBundles(profile);
   return {
-    title: '插件管理（' + profile + '）',
-    info: [],
-    rebuild: () => pluginOpsPanel(profile),
-    items: [
-      {
-        label: 'bundle 列表', hint: '版本与来源',
-        children: async () => {
-          const list = await listBundles(profile);
-          return {
-            title: profile + ' 的 bundle',
-            info: list.length ? [] : [c.gray('（无 bundle）')],
-            items: list.map((b) => ({ label: b.name, hint: b.version + ' [' + b.source + ']' })),
-          };
-        },
-      },
+    title: profile + ' 的 bundle',
+    info: list.length ? [] : [c.gray('（无 bundle）')],
+    items: list.map((b) => ({ label: b.name, hint: b.version + ' [' + b.source + ']' })),
+  };
+}
+
+/** 单个整合包的全部操作（以整合包为中心合并原 插件管理/升级回滚/校验/设置 的散落入口） */
+function profileOpsPanel(ctx, profile) {
+  const p = ctx.profiles.find((x) => x.name === profile);
+  const panel = {
+    title: '整合包「' + profile + '」',
+    info: p ? [
+      c.gray('bundle    ') + p.bundles.length + ' 个',
+      c.gray('dsh 版本  ') + (profileDshVersion(profile) || '跟随默认') + (ctx.def === profile ? c.green(' · 默认整合包') : ''),
+    ] : [c.gray('（整合包已不存在）')],
+    rebuild: async () => profileOpsPanel(await gatherContext(), profile),
+    items: !p ? [] : [
+      { label: '启动', hint: '进入 dsh', run: async () => { await handoffToDsh({ profile }); return 'exit'; } },
+      { label: '校验', hint: '--dump-config', run: () => flowVerify(profile) },
+      { section: true, label: '插件' },
+      { label: 'bundle 列表', hint: '版本与来源', children: () => bundleListPanel(profile) },
       { label: '启用/禁用', hint: 'Enter 直接切换', children: () => bundleTogglePanel(profile) },
       { label: '添加 bundle', dialog: true, run: (h) => flowPluginAdd(h, profile) },
       { label: '移除 bundle', dialog: true, run: (h) => flowPluginRemove(h, profile) },
+      { section: true, label: '更新' },
       { label: '更新检查', hint: 'registry + git', run: () => flowCheckUpdates(profile) },
       { label: '批量更新', hint: '勾选后执行', children: () => batchUpdatePanel(profile) },
+      { label: '依赖升级', hint: 'pnpm update + 快照', run: () => flowUpgrade(profile) },
+      {
+        label: '回滚到快照',
+        children: async () => {
+          const snaps = await listSnapshots(profile);
+          return {
+            title: '选择快照（' + profile + '，新→旧）',
+            info: snaps.length ? [] : [c.gray('（无快照）')],
+            items: snaps.map((ts) => ({ label: ts, run: () => flowRollback(profile, ts) })),
+          };
+        },
+      },
+      { section: true, label: '配置' },
+      { label: '设为默认整合包', inline: true, run: async () => { await setDefaultProfile(profile); return '默认整合包已设为 ' + profile; } },
+      { label: '启动参数（extraArgs）', dialog: true, run: (h) => flowSetExtraArgs(h, profile) },
+      { label: '镜像源（.npmrc）', dialog: true, run: (h) => flowSetNpmrc(h, profile) },
+      { label: '锁定 dsh 版本', hint: '当前：' + (profileDshVersion(profile) || '跟随默认'), children: () => lockVersionPanel(profile) },
+      { section: true, label: '管理' },
+      { label: '导出', hint: 'bdl-pack.json', run: () => flowExportPack(profile) },
+      { label: '复制', dialog: true, run: (h) => flowCopyPack(h, profile) },
+      { label: '重命名', dialog: true, run: (h) => flowRenamePack(h, profile) },
+      { label: '删除', hint: '不可恢复', dialog: true, run: (h) => flowDeletePack(h, profile) },
     ],
   };
+  return panel;
 }
 
 const CATS = [
   {
-    id: 'launch', label: '启动整合包', desc: '选择整合包并启动 dsh',
+    id: 'launch', label: '启动整合包', desc: '选择整合包并启动 dsh（按最近使用排序）',
     panel: (ctx) => {
       const used = (n) => (ctx.meta.bundles && ctx.meta.bundles[n] && ctx.meta.bundles[n].lastUsedAt) || '';
       const ps = [...ctx.profiles].sort((a, b) => (used(b.name) > used(a.name) ? 1 : -1));
@@ -586,28 +643,18 @@ const CATS = [
         info,
         items: ps.map((p) => ({
           label: p.name + (p.name === ctx.def ? '（默认）' : ''),
-          hint: p.bundles.length + ' 个 bundle · dsh ' + profileDshVersion(p.name),
+          hint: p.bundles.length + ' 个 bundle · dsh ' + (profileDshVersion(p.name) || '跟随默认'),
           run: async () => { await handoffToDsh({ profile: p.name }); return 'exit'; },
         })),
       };
     },
   },
   {
-    id: 'packs', label: '整合包管理', desc: '新建 / 下载 / 导入 / 导出 / 复制 / 重命名 / 删除',
+    id: 'packs', label: '整合包管理', desc: '新建 / 下载 / 导入；进入单个整合包的全部操作',
     panel: (ctx) => ({
       title: '整合包管理',
-      info: [ctx.profiles.length ? c.gray('共 ' + ctx.profiles.length + ' 个整合包') : c.gray('（还没有整合包）')],
+      info: [ctx.profiles.length ? c.gray('共 ' + ctx.profiles.length + ' 个；Enter 进入单个整合包（插件 / 更新 / 配置 / 管理）') : c.gray('（还没有整合包）')],
       items: [
-        {
-          label: '浏览整合包', hint: '查看 bundle 构成',
-          children: async () => profilesPanel(await gatherContext(), '浏览整合包', (p) => ({
-            children: () => ({
-              title: p.name + ' 的 bundle',
-              info: p.bundles.length ? [] : [c.gray('（空）')],
-              items: p.bundles.map((b) => ({ label: b })),
-            }),
-          })),
-        },
         { label: '新建整合包', hint: '手动选插件', dialog: true, run: flowCreatePack },
         {
           label: '下载整合包', hint: 'URL / git / index',
@@ -622,23 +669,13 @@ const CATS = [
           }),
         },
         { label: '导入整合包', hint: '本地 bdl-pack.json', dialog: true, run: flowImportPack },
-        { label: '导出整合包', children: async () => profilesPanel(await gatherContext(), '选择要导出的整合包', (p) => ({ run: () => flowExportPack(p.name) })) },
-        { label: '复制整合包', children: async () => profilesPanel(await gatherContext(), '选择要复制的整合包', (p) => ({ dialog: true, run: (h) => flowCopyPack(h, p.name) })) },
-        { label: '重命名整合包', children: async () => profilesPanel(await gatherContext(), '选择要重命名的整合包', (p) => ({ dialog: true, run: (h) => flowRenamePack(h, p.name) })) },
-        { label: '删除整合包', hint: '不可恢复', children: async () => profilesPanel(await gatherContext(), '选择要删除的整合包', (p) => ({ dialog: true, run: (h) => flowDeletePack(h, p.name) })) },
+        ...(ctx.profiles.length ? [{ section: true, label: '已有整合包' }] : []),
+        ...profileItems(ctx, (p) => ({ children: async () => profileOpsPanel(await gatherContext(), p.name) })),
       ],
     }),
   },
   {
-    id: 'plugins', label: '插件管理', desc: 'bundle 列表、启停、增删与更新',
-    panel: (ctx) => ({
-      title: '插件管理 — 选择整合包',
-      info: ctx.profiles.length ? [] : [c.gray('（先创建一个整合包）')],
-      items: profileItems(ctx, (p) => ({ children: () => pluginOpsPanel(p.name) })),
-    }),
-  },
-  {
-    id: 'version', label: 'dsh 版本管理', desc: '安装 / 切换 / 锁定 dsh 版本',
+    id: 'version', label: 'dsh 版本管理', desc: '安装 / 切换默认 / 删除 dsh 版本',
     panel: (ctx) => ({
       title: 'dsh 版本管理',
       info: [
@@ -652,30 +689,6 @@ const CATS = [
         { label: '安装版本', hint: '从 npm 拉取', children: installVersionPanel },
         { label: '切换默认版本', hint: '内联生效', children: switchDefaultPanel },
         { label: '删除版本', children: removeVersionPanel },
-        { label: '锁定整合包版本', children: async () => profilesPanel(await gatherContext(), '选择要锁定版本的整合包', (p) => ({ children: () => lockVersionPanel(p.name) })) },
-      ],
-    }),
-  },
-  {
-    id: 'upgrade', label: '升级与回滚', desc: '依赖升级（带快照）与一键回滚',
-    panel: (ctx) => ({
-      title: '升级与回滚',
-      info: [c.gray('升级前自动快照 package.json / pnpm-lock.yaml / cordis.patch.yml')],
-      items: [
-        { label: '依赖升级', hint: 'pnpm update + 快照', children: async () => profilesPanel(await gatherContext(), '选择要升级依赖的整合包', (p) => ({ run: () => flowUpgrade(p.name) })) },
-        {
-          label: '回滚到快照',
-          children: async () => profilesPanel(await gatherContext(), '选择要回滚的整合包', (p) => ({
-            children: async () => {
-              const snaps = await listSnapshots(p.name);
-              return {
-                title: '选择快照（' + p.name + '，新→旧）',
-                info: snaps.length ? [] : [c.gray('（该整合包无快照）')],
-                items: snaps.map((ts) => ({ label: ts, run: () => flowRollback(p.name, ts) })),
-              };
-            },
-          })),
-        },
       ],
     }),
   },
@@ -692,39 +705,14 @@ const CATS = [
     }),
   },
   {
-    id: 'verify', label: '校验整合包', desc: '--dump-config 组合校验',
+    id: 'diagnose', label: '诊断', desc: '校验整合包组合 / 查看运行日志',
     panel: (ctx) => ({
-      title: '校验整合包 — 选择整合包',
-      info: [c.gray('以 --dump-config 验证 bundle 组合可正常加载')],
-      items: profileItems(ctx, (p) => ({ run: () => flowVerify(p.name) })),
-    }),
-  },
-  {
-    id: 'diagnose', label: '诊断', desc: '查看运行日志',
-    panel: (ctx) => ({
-      title: '诊断 — 选择日志',
+      title: '诊断',
       info: ctx.logs.length ? [] : [c.gray('（无日志文件）')],
-      items: ctx.logs.map((l) => ({ label: l, run: () => flowTailLog(l) })),
-    }),
-  },
-  {
-    id: 'settings', label: '设置', desc: '默认整合包 / 启动参数 / 镜像源',
-    panel: (ctx) => ({
-      title: '设置',
-      info: [
-        c.gray('默认整合包  ') + (ctx.def || '（未设置）'),
-        c.gray('元数据      ') + c.dim(metaPath()),
-      ],
       items: [
-        {
-          label: '设置默认整合包',
-          children: async () => profilesPanel(await gatherContext(), '选择默认整合包', (p) => ({
-            inline: true,
-            run: async () => { await setDefaultProfile(p.name); return '默认整合包已设为 ' + p.name; },
-          })),
-        },
-        { label: '启动参数（extraArgs）', children: async () => profilesPanel(await gatherContext(), '选择整合包', (p) => ({ dialog: true, run: (h) => flowSetExtraArgs(h, p.name) })) },
-        { label: '镜像源（profile .npmrc）', children: async () => profilesPanel(await gatherContext(), '选择整合包', (p) => ({ dialog: true, run: (h) => flowSetNpmrc(h, p.name) })) },
+        { label: '校验整合包', hint: '--dump-config', children: async () => profilesPanel(await gatherContext(), '选择要校验的整合包', (p) => ({ run: () => flowVerify(p.name) })) },
+        ...(ctx.logs.length ? [{ section: true, label: '日志' }] : []),
+        ...ctx.logs.map((l) => ({ label: l, run: () => flowTailLog(l) })),
       ],
     }),
   },
@@ -862,7 +850,7 @@ async function dashboard() {
     stack = [{ title: CATS[cat].label, info: [c.gray('加载中…')], items: [], sel: 0 }];
     paint();
     const p = await CATS[cat].panel(ctx);
-    p.sel = 0;
+    p.sel = firstSel(p.items);
     if (seq === loadSeq) { stack = [p]; paint(); }
   }
 
@@ -870,7 +858,7 @@ async function dashboard() {
   async function refreshRoot() {
     ctx = await gatherContext();
     const p = await CATS[cat].panel(ctx);
-    p.sel = 0;
+    p.sel = firstSel(p.items);
     stack = [p];
     focus = p.items.length ? 'body' : 'nav';
     paint();
@@ -904,7 +892,7 @@ async function dashboard() {
     statusMsg = null;
     if (item.children) {
       const p = await item.children();
-      p.sel = 0;
+      p.sel = firstSel(p.items);
       stack.push(p);
       paint();
       return;
@@ -916,7 +904,7 @@ async function dashboard() {
       const r = await item.run(helpers);
       if (r === 'exit') return 'exit';
       if (r && typeof r === 'object' && Array.isArray(r.items)) {
-        r.sel = 0;
+        r.sel = firstSel(r.items);
         stack.push(r);
         paint();
         return;
@@ -925,7 +913,7 @@ async function dashboard() {
       // 对话可能改了状态：刷新当前分类根面板，焦点留在 body
       ctx = await gatherContext();
       const p = await CATS[cat].panel(ctx);
-      p.sel = 0;
+      p.sel = firstSel(p.items);
       stack = [p];
       focus = p.items.length ? 'body' : 'nav';
       paint();
@@ -994,7 +982,7 @@ async function dashboard() {
     const t = top();
     if (!t || !t.items.length) return;
     const i = layout.bodyOffset + (k.y - layout.bodyItemY);
-    if (i < 0 || i >= t.items.length) return;
+    if (i < 0 || i >= t.items.length || t.items[i].section) return;
     if (i === t.sel && focus === 'body') { tryActivate(t.items[i]); return; }
     t.sel = i;
     focus = 'body';
@@ -1028,13 +1016,13 @@ async function dashboard() {
           await loadRoot();
         } else {
           const t = top();
-          if (t.items.length) { t.sel = (t.sel + d + t.items.length) % t.items.length; paint(); }
+          if (t.items.length) { t.sel = nextSel(t.items, t.sel, d); paint(); }
         }
         continue;
       }
       if (k.name === 'num') {
         if (focus === 'nav') { if (k.n >= 1 && k.n <= CATS.length) { cat = k.n - 1; await loadRoot(); } }
-        else { const t = top(); if (k.n >= 1 && k.n <= t.items.length) { t.sel = k.n - 1; paint(); } }
+        else { const t = top(); const idx = nthSel(t.items, k.n); if (idx >= 0) { t.sel = idx; paint(); } }
         continue;
       }
       if (k.name === 'right') {

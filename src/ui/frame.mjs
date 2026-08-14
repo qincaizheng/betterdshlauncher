@@ -176,6 +176,10 @@ export function renderFrame(o) {
     const i = bodyOffset + j;
     if (i >= items.length) break;
     const item = items[i];
+    if (item.section) { // 分节标题：不可选中的灰色小标题
+      body.push('  ' + c.gray('─ ' + item.label + ' ' + '─'.repeat(Math.max(0, bodyW - stringWidth(item.label) - 8))));
+      continue;
+    }
     const label = (i === o.bodySel ? ' ▸ ' : '   ') + item.label;
     const hint = item.hint ? String(item.hint) : '';
     const lw = stringWidth(label);
