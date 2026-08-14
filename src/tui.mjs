@@ -770,8 +770,11 @@ export async function runTui() {
       if (after.length === 0) return;
     }
 
-    // 终端太小（或行数不足）时回退传统列表菜单
-    const useDashboard = (process.stdout.columns || 80) >= 64 && (process.stdout.rows || 24) >= 18;
+    // 终端太小（内容区放不下 10 个导航项）时回退传统列表菜单
+    const useDashboard = (process.stdout.columns || 80) >= 56 && (process.stdout.rows || 24) >= 15;
+    if (!useDashboard) {
+      console.log(c.gray('（终端窗口较小，使用简易菜单；把窗口拉大到 ≥56×15 即为全屏仪表盘）'));
+    }
     for (;;) {
       const ctx = await gatherContext();
       const id = useDashboard ? await dashboard(ctx, buildBodies(ctx)) : await classicMenu();
